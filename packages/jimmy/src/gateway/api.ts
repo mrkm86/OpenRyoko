@@ -2658,6 +2658,18 @@ async function runWebSession(
       }
     }
 
+    // A turn interrupted by a newer user message is not an error — the newer
+    // message is already being dispatched as its own turn. Surface a calm
+    // notice instead of a red error, and let the new turn drive the UI/status.
+    if (wasInterrupted) {
+      const noticeText = "🔄 新しいメッセージを踏まえて再検討";
+      insertMessage(currentSession.id, "notification", noticeText);
+      context.emit("session:notification", { sessionId: currentSession.id, message: noticeText });
+      updateSession(currentSession.id, { lastActivity: new Date().toISOString(), lastError: null });
+      logger.info(`Web session ${currentSession.id} interrupted by new message — reconsidering`);
+      return;
+    }
+
     // Persist the assistant response
     if (result.result) {
       insertMessage(currentSession.id, "assistant", result.result);
