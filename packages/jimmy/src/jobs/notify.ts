@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { readGatewayAuthToken } from "../gateway/auth.js";
+import { JINN_HOME } from "../shared/paths.js";
 import type { JobState } from "./state.js";
 
 /**
@@ -98,6 +100,8 @@ export function assertLoopbackGatewayUrl(gatewayUrl: string): void {
 export interface NotifyDeps {
   fetchFn?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  /** Read on every attempt so a gateway restart can create or rotate the token. */
+  readAuthToken?: () => string | null;
   /** Retry delays in ms. Default spans ~10 minutes so a gateway restart is survived. */
   retryDelaysMs?: number[];
 }
@@ -116,6 +120,7 @@ export async function sendJobNotification(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const fetchFn = deps.fetchFn ?? fetch;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const readAuthToken = deps.readAuthToken ?? (() => readGatewayAuthToken(JINN_HOME));
   const delays = deps.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
 
   assertLoopbackGatewayUrl(state.gatewayUrl);
@@ -124,9 +129,13 @@ export async function sendJobNotification(
   let lastError = "unknown";
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
+      const token = readAuthToken();
       const res = await fetchFn(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         // dedupeKey: if the gateway accepted an earlier attempt but the
         // response was lost, the retry must not enqueue a second turn.
         body: JSON.stringify({ message, role: "notification", dedupeKey: `job:${state.id}` }),

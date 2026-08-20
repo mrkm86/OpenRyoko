@@ -2,6 +2,22 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.8.21] - 2026-08-20
+
+> Gateway認証を有効にした環境で、`ryoko job run` の完了通知が401になり、元のセッションが起床しない問題を修正。
+
+### Reliability / Fixes
+
+- 完了通知の全リトライに、このOpenRyoko instanceのBearer tokenを自動付与。
+- 各リトライ直前にtokenを再読込し、Gateway再起動中にtokenが作成・更新された場合も復旧。
+- Gateway認証を無効化した既存環境との互換性、および通知のdedupe挙動を維持。
+
+### Verification
+
+- Backend: **97 test files / 782 tests pass**
+- backend TypeScript typecheck、production build、`git diff --check`
+- token付与、token未作成時の互換性、401後のtoken再読込、実job monitor経路を回帰テスト化
+
 ## [2026.8.20] - 2026-08-18
 
 > `gateway.host: 0.0.0.0` / `::` の環境で、AIやCLIへ渡されたURLがGateway自身に

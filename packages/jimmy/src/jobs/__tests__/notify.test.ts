@@ -90,12 +90,45 @@ describe("sendJobNotification", () => {
 
   it("posts the notification to the session message route", async () => {
     const fetchFn = vi.fn(async () => new Response("{}", { status: 200 }));
-    const result = await sendJobNotification(makeState(), "msg", { fetchFn, sleep });
+    const result = await sendJobNotification(makeState(), "msg", {
+      fetchFn,
+      sleep,
+      readAuthToken: () => "test-gateway-token",
+    });
     expect(result.ok).toBe(true);
     expect(fetchFn).toHaveBeenCalledTimes(1);
     const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("http://127.0.0.1:7777/api/sessions/sess-1/message");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer test-gateway-token");
     expect(JSON.parse(String(init.body))).toEqual({ message: "msg", role: "notification", dedupeKey: "job:pdf-build-1" });
+  });
+
+  it("omits authorization when gateway auth has not been initialized", async () => {
+    const fetchFn = vi.fn(async () => new Response("{}", { status: 200 }));
+    await sendJobNotification(makeState(), "msg", { fetchFn, sleep, readAuthToken: () => null });
+
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(new Headers(init.headers).has("authorization")).toBe(false);
+  });
+
+  it("reloads the gateway token for each retry", async () => {
+    const tokens = ["stale-token", "current-token"];
+    const readAuthToken = vi.fn(() => tokens.shift() ?? null);
+    const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const authorization = new Headers(init?.headers).get("authorization");
+      return new Response("{}", { status: authorization === "Bearer current-token" ? 200 : 401 });
+    });
+
+    const result = await sendJobNotification(makeState(), "msg", {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      sleep,
+      readAuthToken,
+      retryDelaysMs: [1],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(readAuthToken).toHaveBeenCalledTimes(2);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it("retries through gateway downtime and succeeds exactly once", async () => {

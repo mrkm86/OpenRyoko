@@ -16,7 +16,7 @@ describe("runJobMonitor", () => {
   let dir: string;
   let server: http.Server;
   let gatewayUrl: string;
-  let received: { url: string; body: { message: string; role: string } }[];
+  let received: { url: string; authorization?: string; body: { message: string; role: string } }[];
 
   beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "job-monitor-"));
@@ -25,7 +25,11 @@ describe("runJobMonitor", () => {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
-        received.push({ url: req.url ?? "", body: JSON.parse(raw) });
+        received.push({
+          url: req.url ?? "",
+          authorization: req.headers.authorization,
+          body: JSON.parse(raw),
+        });
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       });
@@ -60,7 +64,11 @@ describe("runJobMonitor", () => {
 
   it("success: runs the command, logs output, wakes the session once with exit 0", async () => {
     seedJob();
-    const final = await runJobMonitor("j1", { jobsDir: dir, retryDelaysMs: [10] });
+    const final = await runJobMonitor("j1", {
+      jobsDir: dir,
+      retryDelaysMs: [10],
+      readAuthToken: () => "monitor-gateway-token",
+    });
 
     expect(final?.status).toBe("notified");
     expect(final?.exitCode).toBe(0);
@@ -68,6 +76,7 @@ describe("runJobMonitor", () => {
 
     expect(received).toHaveLength(1);
     expect(received[0].url).toBe("/api/sessions/sess-42/message");
+    expect(received[0].authorization).toBe("Bearer monitor-gateway-token");
     expect(received[0].body.role).toBe("notification");
     expect(received[0].body.message).toContain('✅ Detached job "test-job" completed successfully');
     expect(received[0].body.message).toContain("hello-from-job");
