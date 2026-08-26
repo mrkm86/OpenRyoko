@@ -27,17 +27,39 @@ export interface SkillManifestEntry {
   installedAt: string;
 }
 
+/** Canonical skills.json shape — must match template/skills.json and the
+ *  find-and-install skill, which write `{"installed": {<name>: {...}}}`.
+ *  The legacy flat-array form is still accepted on read. */
 export function readManifest(): SkillManifestEntry[] {
   if (!fs.existsSync(SKILLS_JSON)) return [];
   try {
-    return JSON.parse(fs.readFileSync(SKILLS_JSON, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(SKILLS_JSON, "utf-8"));
+    if (Array.isArray(parsed)) {
+      return parsed.filter(
+        (e): e is SkillManifestEntry => !!e && typeof e.name === "string",
+      );
+    }
+    if (parsed && typeof parsed.installed === "object" && parsed.installed !== null) {
+      return Object.entries(parsed.installed).map(([name, meta]) => {
+        const m = (meta ?? {}) as Partial<SkillManifestEntry>;
+        return {
+          name,
+          source: typeof m.source === "string" ? m.source : "",
+          installedAt: typeof m.installedAt === "string" ? m.installedAt : "",
+        };
+      });
+    }
+    return [];
   } catch {
     return [];
   }
 }
 
 export function writeManifest(entries: SkillManifestEntry[]): void {
-  fs.writeFileSync(SKILLS_JSON, JSON.stringify(entries, null, 2) + "\n");
+  const installed = Object.fromEntries(
+    entries.map((e) => [e.name, { source: e.source, installedAt: e.installedAt }]),
+  );
+  fs.writeFileSync(SKILLS_JSON, JSON.stringify({ installed }, null, 2) + "\n");
 }
 
 export function upsertManifest(name: string, source: string): void {
