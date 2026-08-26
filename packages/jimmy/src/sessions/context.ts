@@ -129,13 +129,15 @@ export function buildContext(opts: {
     });
   }
 
-  // ── STANDARD: Self-evolution ────────────────────────────────
+  // ── Self-evolution (ESSENTIAL while onboarding is pending, so the
+  //    BOOTSTRAP pointer can't be trimmed away on a large workspace) ──
   if (!opts.employee) {
+    const onboardingPending = fs.existsSync(path.join(JINN_HOME, "BOOTSTRAP.md"));
     sections.push({
-      tier: Tier.STANDARD,
+      tier: onboardingPending ? Tier.ESSENTIAL : Tier.STANDARD,
       marker: "## Self-evolution",
       content: buildEvolutionContext(portalName, opts.config),
-      summary: `## Self-evolution\nRecord short durable facts in \`~/.ryoko/MEMORY.md\` and long-form context in \`~/.ryoko/knowledge/<topic>.md\` when you learn new info about the user or their projects.`,
+      summary: `## Self-evolution\nRecord short durable facts in \`${JINN_HOME}/MEMORY.md\` and long-form context in \`${JINN_HOME}/knowledge/<topic>.md\` when you learn new info about the user or their projects.`,
     });
   }
 
@@ -207,7 +209,7 @@ export function buildContext(opts: {
       tier: Tier.STANDARD,
       marker: "## Scheduled cron",
       content: cronCtx,
-      summary: "## Scheduled cron jobs\nCron definitions are in `~/.ryoko/cron/jobs.json`. Read directly when needed.",
+      summary: `## Scheduled cron jobs\nCron definitions are in \`${CRON_JOBS}\`. Read directly when needed.`,
     });
   }
 
@@ -218,7 +220,7 @@ export function buildContext(opts: {
       tier: Tier.OPTIONAL,
       marker: "## Knowledge base",
       content: knowledgeCtx,
-      summary: "## Knowledge base\nKnowledge files are in `~/.ryoko/knowledge/` and `~/.ryoko/docs/`. Read them directly when needed.",
+      summary: `## Knowledge base\nKnowledge files are in \`${JINN_HOME}/knowledge/\` and \`${DOCS_DIR}/\`. Read them directly when needed.`,
     });
   }
 
@@ -614,7 +616,7 @@ function buildCronContext(): string | null {
       lines.push(`- **${job.name}**: \`${job.schedule}\`${job.employee ? ` → ${job.employee}` : ""}`);
     }
     if (disabledCount > 0) {
-      lines.push(`\n_${disabledCount} disabled jobs not shown. See \`~/.ryoko/cron/jobs.json\` for the full list._`);
+      lines.push(`\n_${disabledCount} disabled jobs not shown. See \`${CRON_JOBS}\` for the full list._`);
     }
     return lines.join("\n");
   } catch {
@@ -659,7 +661,7 @@ function buildKnowledgeContext(): string | null {
 
   const lines: string[] = [
     `## Knowledge base`,
-    `Knowledge files are in \`~/.ryoko/knowledge/\` and \`~/.ryoko/docs/\`. Read them directly when needed.`,
+    `Knowledge files are in \`${JINN_HOME}/knowledge/\` and \`${DOCS_DIR}/\`. Read them directly when needed.`,
     ``,
   ];
 
@@ -770,7 +772,7 @@ function buildConnectorContext(connectors: string[], _gatewayUrl: string, portal
   lines.push("- When you are directly addressed (mentioned / asked), ALWAYS give a non-empty public reply. Use react-only for pure acknowledgments or social confirmations — never as the answer to a substantive question.");
 
   lines.push("\n- **List all connectors**: `ryoko api GET /api/connectors`");
-  lines.push(`- Channel IDs and connector config can be found in \`~/.ryoko/config.yaml\``);
+  lines.push(`- Channel IDs and connector config can be found in \`${JINN_HOME}/config.yaml\``);
   return lines.join("\n");
 }
 
@@ -835,7 +837,10 @@ export function buildEvolutionContext(portalName: string, config?: JinnConfig): 
       .readFileSync(path.join(JINN_HOME, "knowledge", "user-profile.md"), "utf-8")
       .trim();
   } catch {}
-  const isNew = bootstrapPending || (!hasMemoryFile && legacyProfileContent.length < 50);
+  // A filled legacy profile means an already-onboarded veteran workspace even
+  // when setup has just placed BOOTSTRAP.md (the pre-persona upgrade path) —
+  // don't push those users back into onboarding.
+  const isNew = (bootstrapPending || !hasMemoryFile) && legacyProfileContent.length < 50;
 
   // Conversational discovery hint: a Slack workspace is wired up but the
   // user hasn't enabled the Agents View canvas. Surface it in steady-state
@@ -852,10 +857,10 @@ export function buildEvolutionContext(portalName: string, config?: JinnConfig): 
   if (isNew) {
     lines.push(`**ONBOARDING MODE**: This is a new or not-yet-onboarded ${portalName} installation.`);
     if (bootstrapPending) {
-      lines.push(`Before answering the user's request, read \`~/.ryoko/BOOTSTRAP.md\` and follow it to completion — it walks you through the onboarding skill (filling IDENTITY.md / SOUL.md / MEMORY.md) and is deleted when done.`);
+      lines.push(`Before answering the user's request, read \`${JINN_HOME}/BOOTSTRAP.md\` and follow it to completion — it walks you through the onboarding skill (filling IDENTITY.md / SOUL.md / MEMORY.md) and is deleted when done.`);
     } else {
       lines.push(`Before answering the user's request, introduce yourself briefly and ask who they are, what ${portalName} should help with, their communication preferences, and any active projects.`);
-      lines.push(`Write short durable facts, preferences, and decisions to \`~/.ryoko/MEMORY.md\`; put long-form context in \`~/.ryoko/knowledge/<topic>.md\`.`);
+      lines.push(`Write short durable facts, preferences, and decisions to \`${JINN_HOME}/MEMORY.md\`; put long-form context in \`${JINN_HOME}/knowledge/<topic>.md\`.`);
     }
     lines.push(`Then proceed to help with their original request.`);
     if (canvasHintApplies) {
@@ -865,9 +870,9 @@ export function buildEvolutionContext(portalName: string, config?: JinnConfig): 
     }
   } else {
     lines.push(`You learn and evolve over time. Memory is two-layered — keep the layers separate:`);
-    lines.push(`- Short durable facts, preferences, and decisions (1-3 lines each) → \`~/.ryoko/MEMORY.md\` (read every session; keep it lean)`);
-    lines.push(`- Long-form context (research results, project background, org info) → \`~/.ryoko/knowledge/<topic>.md\` (fetched on demand)`);
-    lines.push(`- Personality / tone feedback → \`~/.ryoko/SOUL.md\`; name or self-image changes → \`~/.ryoko/IDENTITY.md\``);
+    lines.push(`- Short durable facts, preferences, and decisions (1-3 lines each) → \`${JINN_HOME}/MEMORY.md\` (read every session; keep it lean)`);
+    lines.push(`- Long-form context (research results, project background, org info) → \`${JINN_HOME}/knowledge/<topic>.md\` (fetched on demand)`);
+    lines.push(`- Personality / tone feedback → \`${JINN_HOME}/SOUL.md\`; name or self-image changes → \`${JINN_HOME}/IDENTITY.md\``);
     lines.push(`\nDo this silently — don't announce every file update. Just evolve.`);
     if (canvasHintApplies) {
       lines.push(

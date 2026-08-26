@@ -8,6 +8,9 @@ vi.mock("node:fs", async () => {
       ...actual,
       existsSync: vi.fn(() => true),
       readFileSync: vi.fn(),
+      // paths.ts runs migrateLegacyHome() at module load — never let a
+      // per-path existsSync mock reach the real renameSync.
+      renameSync: vi.fn(),
     },
   };
 });
@@ -16,6 +19,7 @@ vi.mock("../../gateway/services.js", () => ({ buildServiceRegistry: vi.fn(() => 
 vi.mock("../../jobs/state.js", () => ({ findJobsNeedingAttention: vi.fn(() => []) }));
 
 import fs from "node:fs";
+import { JINN_HOME } from "../../shared/paths.js";
 import { buildEvolutionContext } from "../context.js";
 
 const mockExistsSync = vi.mocked(fs.existsSync);
@@ -46,6 +50,19 @@ describe("buildEvolutionContext", () => {
     const out = buildEvolutionContext("Ryoko");
     expect(out).toContain("ONBOARDING MODE");
     expect(out).toContain("BOOTSTRAP.md");
+  });
+
+  it("embeds the real instance home, not a hardcoded ~/.ryoko (custom RYOKO_INSTANCE installs)", () => {
+    setWorkspace({ bootstrap: true });
+    const out = buildEvolutionContext("Ryoko");
+    expect(out).toContain(`${JINN_HOME}/BOOTSTRAP.md`);
+    expect(out).not.toContain("~/.jinn");
+  });
+
+  it("does NOT trap an upgraded veteran (BOOTSTRAP.md pending + rich legacy profile) in onboarding", () => {
+    setWorkspace({ bootstrap: true, legacyProfile: "x".repeat(200) });
+    const out = buildEvolutionContext("Ryoko");
+    expect(out).not.toContain("ONBOARDING MODE");
   });
 
   it("steady state teaches the two-layer memory scheme (regression: upstream 3-file scheme contradicted AGENTS.md)", () => {

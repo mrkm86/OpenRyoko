@@ -9,6 +9,9 @@ vi.mock("node:fs", async () => {
       existsSync: vi.fn(() => true),
       readFileSync: vi.fn(),
       writeFileSync: vi.fn(),
+      // paths.ts runs migrateLegacyHome() at module load — never let a
+      // per-path existsSync mock reach the real renameSync.
+      renameSync: vi.fn(),
     },
   };
 });
@@ -18,6 +21,7 @@ import {
   readManifest,
   writeManifest,
   upsertManifest,
+  removeFromManifest,
   SKILLS_JSON,
 } from "../skills.js";
 
@@ -63,9 +67,16 @@ describe("skills.json manifest", () => {
 
   it("still reads the legacy flat-array format", () => {
     mockReadFileSync.mockReturnValue(
-      JSON.stringify([{ name: "a", source: "s", installedAt: "t" }]),
+      JSON.stringify([{ name: "a", source: "own/rep@a", installedAt: "t" }]),
     );
-    expect(readManifest()).toEqual([{ name: "a", source: "s", installedAt: "t" }]);
+    expect(readManifest()).toEqual([{ name: "a", source: "own/rep@a", installedAt: "t" }]);
+  });
+
+  it("rejects {\"installed\": [...]} instead of mis-parsing array indices as names", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ installed: [{ name: "a", source: "own/rep@a", installedAt: "t" }] }),
+    );
+    expect(readManifest()).toEqual([]);
   });
 
   it("returns [] for malformed JSON or a missing file", () => {
@@ -73,6 +84,22 @@ describe("skills.json manifest", () => {
     expect(readManifest()).toEqual([]);
     mockExistsSync.mockReturnValue(false);
     expect(readManifest()).toEqual([]);
+  });
+
+  it("blanks a source that is not owner/repo[@skill]-shaped — it later reaches npx argv", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        installed: {
+          evil: { source: "owner/repo@x; echo PWNED > /tmp/pwned.txt", installedAt: "t" },
+          fine: { source: "owner/repo@skill", installedAt: "t" },
+          repo: { source: "owner/repo", installedAt: "t" },
+        },
+      }),
+    );
+    const byName = Object.fromEntries(readManifest().map((e) => [e.name, e.source]));
+    expect(byName.evil).toBe("");
+    expect(byName.fine).toBe("owner/repo@skill");
+    expect(byName.repo).toBe("owner/repo");
   });
 
   it("writes the canonical object format", () => {
@@ -88,5 +115,47 @@ describe("skills.json manifest", () => {
     const written = lastWrittenJson();
     expect(written.installed["deploy-fly"].source).toBe("owner/repo@deploy-fly");
     expect(typeof written.installed["deploy-fly"].installedAt).toBe("string");
+  });
+
+  it("preserves fields other writers added — per entry and top-level", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        schemaVersion: 1,
+        installed: {
+          a: { source: "own/rep@a", installedAt: "t", description: "keep me" },
+        },
+      }),
+    );
+    upsertManifest("a", "own/rep@a2");
+    const written = lastWrittenJson();
+    expect(written.schemaVersion).toBe(1);
+    expect(written.installed.a.description).toBe("keep me");
+    expect(written.installed.a.source).toBe("own/rep@a2");
+  });
+
+  it("preserves extra legacy-array fields through the object migration", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify([{ name: "a", source: "own/rep@a", installedAt: "t", version: "1.2.3" }]),
+    );
+    upsertManifest("b", "own/rep@b");
+    const written = lastWrittenJson();
+    expect(written.installed.a.version).toBe("1.2.3");
+    expect(written.installed.b.source).toBe("own/rep@b");
+  });
+
+  it("removeFromManifest keeps unrelated entries and top-level fields", () => {
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({
+        schemaVersion: 1,
+        installed: {
+          a: { source: "own/rep@a", installedAt: "t" },
+          b: { source: "own/rep@b", installedAt: "t" },
+        },
+      }),
+    );
+    expect(removeFromManifest("a")).toBe(true);
+    const written = lastWrittenJson();
+    expect(written.schemaVersion).toBe(1);
+    expect(written.installed).toEqual({ b: { source: "own/rep@b", installedAt: "t" } });
   });
 });

@@ -27,63 +27,93 @@ export interface SkillManifestEntry {
   installedAt: string;
 }
 
+/** skills.json is written freely by the agent (see find-and-install), so
+ *  `source` is untrusted input that later reaches `npx skills add`. Only
+ *  accept the "owner/repo" / "owner/repo@skill" shapes. */
+const SOURCE_RE = /^[\w.-]+\/[\w.-]+(@[\w.-]+)?$/;
+
+function sanitizeSource(v: unknown): string {
+  return typeof v === "string" && SOURCE_RE.test(v) ? v : "";
+}
+
+interface RawManifest {
+  installed: Record<string, Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
 /** Canonical skills.json shape — must match template/skills.json and the
  *  find-and-install skill, which write `{"installed": {<name>: {...}}}`.
- *  The legacy flat-array form is still accepted on read. */
-export function readManifest(): SkillManifestEntry[] {
-  if (!fs.existsSync(SKILLS_JSON)) return [];
+ *  The legacy flat-array form is still accepted on read. Fields this CLI
+ *  doesn't know about (per entry or top-level) are preserved on write. */
+function readRawManifest(): RawManifest {
+  if (!fs.existsSync(SKILLS_JSON)) return { installed: {} };
   try {
     const parsed = JSON.parse(fs.readFileSync(SKILLS_JSON, "utf-8"));
     if (Array.isArray(parsed)) {
-      return parsed.filter(
-        (e): e is SkillManifestEntry => !!e && typeof e.name === "string",
+      const installed = Object.fromEntries(
+        parsed
+          .filter((e) => !!e && typeof e.name === "string")
+          .map(({ name, ...rest }) => [name, rest as Record<string, unknown>]),
       );
+      return { installed };
     }
-    if (parsed && typeof parsed.installed === "object" && parsed.installed !== null) {
-      return Object.entries(parsed.installed).map(([name, meta]) => {
-        const m = (meta ?? {}) as Partial<SkillManifestEntry>;
-        return {
-          name,
-          source: typeof m.source === "string" ? m.source : "",
-          installedAt: typeof m.installedAt === "string" ? m.installedAt : "",
-        };
-      });
+    if (
+      parsed && typeof parsed === "object" &&
+      parsed.installed && typeof parsed.installed === "object" &&
+      !Array.isArray(parsed.installed)
+    ) {
+      return parsed as RawManifest;
     }
-    return [];
+    return { installed: {} };
   } catch {
-    return [];
+    return { installed: {} };
   }
 }
 
+function writeRawManifest(raw: RawManifest): void {
+  fs.writeFileSync(SKILLS_JSON, JSON.stringify(raw, null, 2) + "\n");
+}
+
+export function readManifest(): SkillManifestEntry[] {
+  return Object.entries(readRawManifest().installed).map(([name, meta]) => {
+    const m = (meta ?? {}) as Record<string, unknown>;
+    return {
+      name,
+      source: sanitizeSource(m.source),
+      installedAt: typeof m.installedAt === "string" ? m.installedAt : "",
+    };
+  });
+}
+
+/** Full replace in canonical form. Prefer upsertManifest/removeFromManifest,
+ *  which preserve fields other writers may have added. */
 export function writeManifest(entries: SkillManifestEntry[]): void {
   const installed = Object.fromEntries(
     entries.map((e) => [e.name, { source: e.source, installedAt: e.installedAt }]),
   );
-  fs.writeFileSync(SKILLS_JSON, JSON.stringify({ installed }, null, 2) + "\n");
+  writeRawManifest({ installed });
 }
 
 export function upsertManifest(name: string, source: string): void {
-  const manifest = readManifest();
-  const idx = manifest.findIndex((e) => e.name === name);
-  const entry: SkillManifestEntry = {
-    name,
-    source,
-    installedAt: new Date().toISOString(),
-  };
-  if (idx >= 0) {
-    manifest[idx] = entry;
-  } else {
-    manifest.push(entry);
-  }
-  writeManifest(manifest);
+  const raw = readRawManifest();
+  writeRawManifest({
+    ...raw,
+    installed: {
+      ...raw.installed,
+      [name]: {
+        ...(raw.installed[name] ?? {}),
+        source,
+        installedAt: new Date().toISOString(),
+      },
+    },
+  });
 }
 
 export function removeFromManifest(name: string): boolean {
-  const manifest = readManifest();
-  const idx = manifest.findIndex((e) => e.name === name);
-  if (idx < 0) return false;
-  manifest.splice(idx, 1);
-  writeManifest(manifest);
+  const raw = readRawManifest();
+  if (!(name in raw.installed)) return false;
+  const { [name]: _removed, ...rest } = raw.installed;
+  writeRawManifest({ ...raw, installed: rest });
   return true;
 }
 
@@ -167,7 +197,7 @@ export function skillsFind(query?: string): void {
   if (query) args.push(query);
   const result = spawnSync("npx", args, {
     stdio: "inherit",
-    shell: true,
+    // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
   });
   process.exitCode = result.status ?? 1;
 }
@@ -181,7 +211,7 @@ export function skillsAdd(pkg: string): void {
   // Run npx skills add
   const result = spawnSync("npx", ["skills", "add", pkg, "-g", "-y"], {
     stdio: "inherit",
-    shell: true,
+    // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
   });
 
   if (result.status !== 0) {
@@ -273,11 +303,15 @@ export function skillsUpdate(): void {
 
   console.log(`\n${manifest.length} 件のスキルを更新中...\n`);
   for (const entry of manifest) {
+    if (!entry.source) {
+      console.log(`  ${YELLOW}${entry.name}: source が不正または未記録のためスキップ${RESET}`);
+      continue;
+    }
     console.log(`  ${entry.name} を ${entry.source} から更新中...`);
     const before = snapshotDirs();
     const result = spawnSync("npx", ["skills", "add", entry.source, "-g", "-y"], {
       stdio: "pipe",
-      shell: true,
+      // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
     });
 
     if (result.status !== 0) {
@@ -316,11 +350,15 @@ export function skillsRestore(): void {
       continue;
     }
 
+    if (!entry.source) {
+      console.log(`  ${YELLOW}${entry.name}: source が不正または未記録のためスキップ${RESET}`);
+      continue;
+    }
     console.log(`  Installing ${entry.name} from ${entry.source}...`);
     const before = snapshotDirs();
     const result = spawnSync("npx", ["skills", "add", entry.source, "-g", "-y"], {
       stdio: "pipe",
-      shell: true,
+      // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
     });
 
     if (result.status !== 0) {

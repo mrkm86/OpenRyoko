@@ -26,7 +26,7 @@ import {
   buildTemplateReplacements,
 } from "../shared/templateReplacements.js";
 import { ensureOwnerOnlyDirectory } from "../shared/owner-only.js";
-import { buildInitialConfig, CONFIG_TEMPLATE_PATH } from "./initial-config.js";
+import { buildInitialConfig } from "./initial-config.js";
 
 const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
@@ -336,11 +336,7 @@ export async function runSetup(opts?: { force?: boolean }): Promise<void> {
   const templateAgents = path.join(TEMPLATE_DIR, "AGENTS.md");
 
   if (!fs.existsSync(CONFIG_PATH)) {
-    const { source, usedTemplate } = buildInitialConfig(chosenEngine, chosenName);
-    if (!usedTemplate) {
-      warn(`config テンプレート (${CONFIG_TEMPLATE_PATH}) が見つからないため、最小構成で生成します`);
-    }
-    ensureFile(CONFIG_PATH, source);
+    ensureFile(CONFIG_PATH, buildInitialConfig(chosenEngine, chosenName));
     created.push(CONFIG_PATH);
   }
 
