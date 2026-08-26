@@ -24,7 +24,8 @@ Traditional approaches build custom tool-calling loops, manage context windows, 
 ```
 ~/.ryoko/
   config.yaml          # Gateway configuration
-  sessions/registry.db             # SQLite session registry
+  sessions/
+    registry.db        # SQLite session registry
   docs/                # These reference docs
   skills/              # Skill directories with SKILL.md files
   cron/

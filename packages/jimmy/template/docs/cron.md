@@ -76,6 +76,8 @@ Each job execution is logged to `~/.ryoko/cron/runs/<jobId>.jsonl`. Each line is
 
 When a cron job produces analytical, reporting, or decision-informing output, it should **always target {{portalSlug}}** (the COO), not the employee directly. {{portalName}} then delegates to the employee via a child session, reviews the output, filters noise, and delivers the final result.
 
+> Note: `"employee": "{{portalSlug}}"` here refers to the COO portal session itself — it is NOT an `org/` employee (org.md: `org/` starts empty and {{portalName}} is not defined there). The runner resolves an unknown employee name to a portal session, which is exactly the intended routing.
+
 **Correct** — cron → {{portalSlug}} → employee (via child session) → {{portalSlug}} reviews → delivery:
 ```json
 {
