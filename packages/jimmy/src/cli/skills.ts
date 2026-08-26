@@ -43,6 +43,16 @@ function sanitizeSource(v: unknown): string {
   return typeof v === "string" && SOURCE_RE.test(v) ? v : "";
 }
 
+export function isValidSource(pkg: string): boolean {
+  return SOURCE_RE.test(pkg);
+}
+
+/** Free-text search terms may still cross the win32 shell:true path — strip
+ *  anything cmd.exe could reinterpret. Harmless for search relevance. */
+export function sanitizeFindQuery(query: string): string {
+  return query.replace(/[^\w .@/-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 interface RawManifest {
   installed: Record<string, Record<string, unknown>>;
   [key: string]: unknown;
@@ -201,7 +211,8 @@ function copyDirRecursive(src: string, dest: string): void {
 
 export function skillsFind(query?: string): void {
   const args = ["skills", "find"];
-  if (query) args.push(query);
+  const cleaned = query ? sanitizeFindQuery(query) : "";
+  if (cleaned) args.push(cleaned);
   const result = spawnSync("npx", args, {
     stdio: "inherit",
     ...NPX_SPAWN_OPTS,
@@ -210,6 +221,11 @@ export function skillsFind(query?: string): void {
 }
 
 export function skillsAdd(pkg: string): void {
+  if (!isValidSource(pkg)) {
+    console.error(`${RED}source は owner/repo または owner/repo@skill 形式で指定してください: ${pkg}${RESET}`);
+    process.exitCode = 1;
+    return;
+  }
   console.log(`\nスキルをインストール中: ${pkg}\n`);
 
   // Snapshot before

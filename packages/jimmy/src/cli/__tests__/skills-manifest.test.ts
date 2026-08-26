@@ -22,6 +22,8 @@ import {
   writeManifest,
   upsertManifest,
   removeFromManifest,
+  isValidSource,
+  sanitizeFindQuery,
   SKILLS_JSON,
 } from "../skills.js";
 
@@ -147,6 +149,17 @@ describe("skills.json manifest", () => {
     const written = lastWrittenJson();
     expect(written.installed.a.version).toBe("1.2.3");
     expect(written.installed.b.source).toBe("own/rep@b");
+  });
+
+  it("validates CLI-provided sources and sanitizes find queries (win32 shell:true path)", () => {
+    expect(isValidSource("owner/repo@skill")).toBe(true);
+    expect(isValidSource("owner/repo")).toBe(true);
+    expect(isValidSource("owner/repo@x; echo PWNED")).toBe(false);
+    expect(isValidSource("a & calc")).toBe(false);
+    expect(isValidSource("../repo")).toBe(false);
+    expect(sanitizeFindQuery("ios swift xcode")).toBe("ios swift xcode");
+    expect(sanitizeFindQuery("react & del /q *")).toBe("react del /q");
+    expect(sanitizeFindQuery('foo" | calc')).toBe("foo calc");
   });
 
   it("removeFromManifest keeps unrelated entries and top-level fields", () => {
