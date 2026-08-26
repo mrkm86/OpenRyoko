@@ -6,6 +6,10 @@ import yaml from "js-yaml";
  * every other line byte-identical. A whole-file `yaml.dump` round-trip strips
  * all comments — and the shipped config template is mostly guidance comments,
  * so onboarding must never rewrite the file wholesale.
+ *
+ * Known limitation: comments INSIDE the portal block itself are regenerated
+ * away. The shipped template keeps that block comment-free, so nothing is
+ * lost in practice; keep it that way when editing the template.
  */
 export function patchPortalSection(raw: string, portal: Record<string, unknown>): string {
   const defined = Object.fromEntries(

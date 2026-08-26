@@ -91,6 +91,9 @@ describe("skills.json manifest", () => {
       JSON.stringify({
         installed: {
           evil: { source: "owner/repo@x; echo PWNED > /tmp/pwned.txt", installedAt: "t" },
+          dot: { source: "./repo", installedAt: "t" },
+          dotdot: { source: "../repo", installedAt: "t" },
+          hidden: { source: ".hidden/repo", installedAt: "t" },
           fine: { source: "owner/repo@skill", installedAt: "t" },
           repo: { source: "owner/repo", installedAt: "t" },
         },
@@ -98,6 +101,9 @@ describe("skills.json manifest", () => {
     );
     const byName = Object.fromEntries(readManifest().map((e) => [e.name, e.source]));
     expect(byName.evil).toBe("");
+    expect(byName.dot).toBe("");
+    expect(byName.dotdot).toBe("");
+    expect(byName.hidden).toBe("");
     expect(byName.fine).toBe("owner/repo@skill");
     expect(byName.repo).toBe("owner/repo");
   });

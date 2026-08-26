@@ -29,8 +29,15 @@ export interface SkillManifestEntry {
 
 /** skills.json is written freely by the agent (see find-and-install), so
  *  `source` is untrusted input that later reaches `npx skills add`. Only
- *  accept the "owner/repo" / "owner/repo@skill" shapes. */
-const SOURCE_RE = /^[\w.-]+\/[\w.-]+(@[\w.-]+)?$/;
+ *  accept the "owner/repo" / "owner/repo@skill" shapes — each segment must
+ *  start alphanumeric, so `./x`, `../x`, and `.hidden/x` (local-path forms
+ *  the skills CLI would resolve) are rejected. */
+const SOURCE_RE = /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*(@[\w.-]+)?$/;
+
+/** POSIX spawns npx directly (argv is never shell-parsed — that is the
+ *  injection boundary for agent-written sources). Windows needs a shell to
+ *  resolve npx.cmd; safe there because every source is SOURCE_RE-validated. */
+const NPX_SPAWN_OPTS = process.platform === "win32" ? { shell: true as const } : {};
 
 function sanitizeSource(v: unknown): string {
   return typeof v === "string" && SOURCE_RE.test(v) ? v : "";
@@ -197,7 +204,7 @@ export function skillsFind(query?: string): void {
   if (query) args.push(query);
   const result = spawnSync("npx", args, {
     stdio: "inherit",
-    // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
+    ...NPX_SPAWN_OPTS,
   });
   process.exitCode = result.status ?? 1;
 }
@@ -211,7 +218,7 @@ export function skillsAdd(pkg: string): void {
   // Run npx skills add
   const result = spawnSync("npx", ["skills", "add", pkg, "-g", "-y"], {
     stdio: "inherit",
-    // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
+    ...NPX_SPAWN_OPTS,
   });
 
   if (result.status !== 0) {
@@ -311,7 +318,7 @@ export function skillsUpdate(): void {
     const before = snapshotDirs();
     const result = spawnSync("npx", ["skills", "add", entry.source, "-g", "-y"], {
       stdio: "pipe",
-      // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
+      ...NPX_SPAWN_OPTS,
     });
 
     if (result.status !== 0) {
@@ -358,7 +365,7 @@ export function skillsRestore(): void {
     const before = snapshotDirs();
     const result = spawnSync("npx", ["skills", "add", entry.source, "-g", "-y"], {
       stdio: "pipe",
-      // no shell: argv must never be re-parsed — source strings come from the agent-written skills.json
+      ...NPX_SPAWN_OPTS,
     });
 
     if (result.status !== 0) {
