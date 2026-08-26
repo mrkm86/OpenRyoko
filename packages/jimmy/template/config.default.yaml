@@ -82,10 +82,10 @@ mcp:
   #     env:
   #       API_KEY: ${MY_API_KEY}
 
-# セッション上限（従業員ごとにYAMLで上書き可）
-sessions:
-  maxDurationMinutes: 30
-  maxCostUsd: 10.00
+# セッション上限（予約済みキー: 現行ランタイムはまだ参照しない。有効化しても効かない点に注意）
+# sessions:
+#   maxDurationMinutes: 30
+#   maxCostUsd: 10.00
 
 # Cron設定
 cron:

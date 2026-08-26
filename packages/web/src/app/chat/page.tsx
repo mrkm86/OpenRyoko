@@ -22,7 +22,7 @@ import { consumeUrlSessionSelection } from '@/components/chat/url-session-select
 function getOnboardingPrompt(portalName: string, userMessage: string) {
   return `This is your first time being activated. The user just set up ${portalName} and opened the web dashboard for the first time.
 
-Read your CLAUDE.md instructions and the onboarding skill at ~/.jinn/skills/onboarding/SKILL.md, then follow the onboarding flow:
+Read your CLAUDE.md instructions and the onboarding skill at ./skills/onboarding/SKILL.md (relative to your home directory, which is your working directory), then follow the onboarding flow:
 - Greet the user warmly and introduce yourself as ${portalName}
 - Briefly explain what you can do (manage cron jobs, hire AI employees, connect to Slack, etc.)
 - Ask the user what they'd like to set up first

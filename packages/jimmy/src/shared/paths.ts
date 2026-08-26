@@ -68,7 +68,15 @@ export const STT_MODELS_DIR = path.join(JINN_HOME, "models", "whisper");
 export const PID_FILE = path.join(JINN_HOME, "gateway.pid");
 export const CLAUDE_SKILLS_DIR = path.join(JINN_HOME, ".claude", "skills");
 export const AGENTS_SKILLS_DIR = path.join(JINN_HOME, ".agents", "skills");
-export const TEMPLATE_DIR = path.join(__dirname, "..", "..", "..", "template");
+/** Resolves for both layouts: dist/src/shared/ (built package) and
+ *  src/shared/ (vitest / ts-node running from source). */
+export const TEMPLATE_DIR = (() => {
+  const candidates = [
+    path.join(__dirname, "..", "..", "..", "template"),
+    path.join(__dirname, "..", "..", "template"),
+  ];
+  return candidates.find((c) => fs.existsSync(c)) ?? candidates[0];
+})();
 export const FILES_DIR = path.join(JINN_HOME, "files");
 export const MIGRATIONS_DIR = path.join(JINN_HOME, "migrations");
 export const TEMPLATE_MIGRATIONS_DIR = path.join(TEMPLATE_DIR, "migrations");
