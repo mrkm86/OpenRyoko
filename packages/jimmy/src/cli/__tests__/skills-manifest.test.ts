@@ -160,6 +160,8 @@ describe("skills.json manifest", () => {
     expect(sanitizeFindQuery("ios swift xcode")).toBe("ios swift xcode");
     expect(sanitizeFindQuery("react & del /q *")).toBe("react del /q");
     expect(sanitizeFindQuery('foo" | calc')).toBe("foo calc");
+    expect(sanitizeFindQuery("動画生成 スライド")).toBe("動画生成 スライド");
+    expect(sanitizeFindQuery("動画 & del")).toBe("動画 del");
   });
 
   it("removeFromManifest keeps unrelated entries and top-level fields", () => {

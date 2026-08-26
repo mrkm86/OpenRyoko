@@ -50,7 +50,9 @@ export function isValidSource(pkg: string): boolean {
 /** Free-text search terms may still cross the win32 shell:true path — strip
  *  anything cmd.exe could reinterpret. Harmless for search relevance. */
 export function sanitizeFindQuery(query: string): string {
-  return query.replace(/[^\w .@/-]+/g, " ").replace(/\s+/g, " ").trim();
+  // \p{L}\p{N} keeps every script (Japanese queries included) while still
+  // stripping shell metacharacters for the win32 shell:true path.
+  return query.replace(/[^\p{L}\p{N}_ .@/-]+/gu, " ").replace(/\s+/g, " ").trim();
 }
 
 interface RawManifest {
