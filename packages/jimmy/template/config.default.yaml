@@ -92,6 +92,11 @@ cron:
   # alertConnector: slack
   # alertChannel: "#alerts"
 
+# portal.operatorSlackId = オペレータ本人の Slack ID。設定すると本人確認が ID の
+# 厳密一致になり、表示名の一致では「オペレータ本人」と扱われなくなる（表示名は
+# 誰でも変更できるため、信頼できないメンバーがいるワークスペースでは必ず設定する）。
+#   operatorSlackId: U0XXXXXXX
+#
 # portal.trustedSpeakers = MEMORY.md（長期記憶）を DM で注入してよい「信頼話者」の
 # Slack ID リスト。オペレータ本人の ID も必ずここに入れる（表示名は偽装できるため、
 # 名前ではなく不変の Slack ID だけがゲートを通る）。

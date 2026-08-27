@@ -20,7 +20,7 @@ vi.mock("../../jobs/state.js", () => ({ findJobsNeedingAttention: vi.fn(() => []
 
 import fs from "node:fs";
 import type { JinnConfig } from "../../shared/types.js";
-import { buildMemoryContext, isMemoryEligible } from "../context.js";
+import { buildMemoryContext, isMemoryEligible, resolveOperatorIdentity } from "../context.js";
 
 const mockReadFileSync = vi.mocked(fs.readFileSync);
 
@@ -78,6 +78,27 @@ describe("isMemoryEligible", () => {
       isMemoryEligible({ source: "telegram", channel: "D0123456", speakerSlackId: "U0AAAAAAA", config: CONFIG }),
     ).toBe(false);
     expect(isMemoryEligible({ source: "cron", channel: "cron:daily", config: CONFIG })).toBe(false);
+  });
+});
+
+describe("resolveOperatorIdentity", () => {
+  const STRICT = {
+    portal: { operatorName: "太郎", operatorSlackId: "U0OPERATOR" },
+  } as unknown as JinnConfig;
+
+  it("with operatorSlackId configured, only the exact ID is the operator — name spoofing gains nothing", () => {
+    expect(
+      resolveOperatorIdentity({ speakerNames: ["太郎"], speakerSlackId: "U0EVIL0000", operatorName: "太郎", config: STRICT }),
+    ).toEqual({ speakerIsOperator: false, operatorIdVerified: false });
+    expect(
+      resolveOperatorIdentity({ speakerNames: ["別名"], speakerSlackId: "U0OPERATOR", operatorName: "太郎", config: STRICT }),
+    ).toEqual({ speakerIsOperator: true, operatorIdVerified: true });
+  });
+
+  it("without operatorSlackId, name matching still works but is reported as unverified", () => {
+    const r = resolveOperatorIdentity({ speakerNames: ["太郎"], operatorName: "太郎", config: CONFIG });
+    expect(r.speakerIsOperator).toBe(true);
+    expect(r.operatorIdVerified).toBe(false);
   });
 });
 
