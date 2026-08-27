@@ -1,6 +1,6 @@
 {
   "name": "openryoko",
-  "version": "2026.8.21",
+  "version": "2026.8.27",
   "description": "OpenRyoko — Slackで空気を読んで働くAIアシスタント・ゲートウェイ（Jinnベース、Claude Code/Codex/Gemini CLI対応）",
   "license": "MIT",
   "type": "module",
@@ -17,7 +17,7 @@
     "template/"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -r assets dist/assets",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -r assets dist/assets && cp -r ../web/out dist/web",
     "dev": "tsc && (tsc --watch &) && node --watch-path=dist dist/bin/jimmy.js start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

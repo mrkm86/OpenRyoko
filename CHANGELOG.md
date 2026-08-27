@@ -2,6 +2,29 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.8.27] - 2026-08-27
+
+> 新規セットアップ体験の総点検リリース。config テンプレート・skills.json・メモリ指示・同梱 docs・Web オンボーディングの不整合をまとめて修正し、Codex + 独立レビュアーによる多段レビューで発覚したセキュリティ問題も解消。
+
+### このリリースでできるようになったこと
+
+- **ドキュメント通りのデフォルトが実際に適用される**: `ryoko setup` が同梱テンプレート `config.default.yaml` を正しく使うようになった（従来はファイル名不一致で常に最小構成へ無言フォールバックし、`mcp.fetch` 等が無効だった）。名前に `"` や `\` や `$` を含めても config が壊れない
+- **`ryoko skills list / add / update` が素の環境で動く**: skills.json の正典を `{"installed": {...}}` オブジェクト形式に統一（テンプレート・find-and-install スキルと一致）。旧配列形式も読める。未知フィールドは保持
+- **メモリ指示の一本化**: セッション注入プロンプトを MEMORY.md + knowledge/ の2層方式に統一（upstream 由来の user-profile 3ファイル方式と旧 `~/.jinn` パス表記を全廃）。オンボーディング判定は BOOTSTRAP.md 基準になり、旧版から移行したユーザーがオンボーディングに閉じ込められない
+- **Web オンボーディングが日本語テンプレートに効く**: 名前変更が CLAUDE.md / AGENTS.md / IDENTITY.md に正しく反映。言語だけの変更で名前が Ryoko に巻き戻らない。config.yaml の書き換えは portal ブロック限定になり、テンプレートの案内コメントが消えない
+- **カスタムインスタンス対応**: 注入プロンプト・BOOTSTRAP.md・同梱スキルの操作パスを実インスタンスホーム（`JINN_HOME` / cwd 相対）に統一。`RYOKO_INSTANCE` 環境でも正しい場所を操作する
+
+### Security
+
+- agent が自由に書く skills.json の `source` が `shell: true` の spawn に到達するコマンドインジェクション経路を遮断（POSIX はシェルなし直接 spawn、source は `owner/repo[@skill]` 形式のみ許可、`../repo` 等のローカルパス形式も拒否）
+- Windows 互換のため shell 経由になる経路も、CLI 引数の形式検証と検索語の無害化（Unicode 対応・日本語検索語は保持）で全 argv を検証済みに
+
+### Verification
+
+- Backend: **102 test files / 822 tests pass**（前版から +26。セキュリティ・回帰ケースを追加）
+- Codex（gpt-5.6-sol）と独立コードレビュアーによる4巡のレビューで CRITICAL〜MEDIUM 指摘を全消化、最終 VERDICT: OK
+- PR: [#51](https://github.com/rsensui2/OpenRyoko/pull/51) / [#52](https://github.com/rsensui2/OpenRyoko/pull/52)
+
 ## [2026.8.21] - 2026-08-20
 
 > Gateway認証を有効にした環境で、`ryoko job run` の完了通知が401になり、元のセッションが起床しない問題を修正。
