@@ -129,14 +129,14 @@ export function buildContext(opts: {
     });
   }
 
-  // ── ESSENTIAL: Long-term memory — trusted speakers only ─────
-  // MEMORY.md holds the operator's personal facts, so it is injected only
-  // when the current speaker is trusted. Employee and cron sessions (no
-  // trusted speaker present) never receive it.
+  // ── ESSENTIAL: Long-term memory — privacy-gated ─────────────
+  // MEMORY.md holds the operator's personal facts. Injected only in web
+  // sessions and trusted DMs (see isMemoryEligible); employee and cron
+  // sessions never receive it.
   if (!opts.employee) {
     const memoryCtx = buildMemoryContext({
       source: opts.source,
-      speakerIsOperator,
+      channel: opts.channel,
       speakerSlackId: opts.speakerSlackId,
       config: opts.config,
     });
@@ -845,33 +845,43 @@ function buildEnvironmentContext(): string | null {
   return lines.join("\n");
 }
 
-/** Privacy gate for MEMORY.md injection: the operator, private web sessions,
- *  and speakers listed in portal.trustedSpeakers. Everyone else — customers,
- *  guests in shared channels, employee/cron sessions with no speaker — gets
- *  no MEMORY in the prompt. */
-export function isTrustedSpeaker(opts: {
+/** Privacy gate for MEMORY.md injection.
+ *
+ *  Eligible: authenticated web-UI sessions, and Slack DIRECT MESSAGES whose
+ *  speaker's Slack ID is listed in portal.trustedSpeakers (the operator lists
+ *  their own ID there too).
+ *
+ *  Deliberately NOT eligible:
+ *  - Shared channels, even for trusted speakers — the engine session is
+ *    reused per thread, so injected memory would linger in history that later
+ *    untrusted participants build on.
+ *  - Display-name/handle operator matching — names are freely editable, so
+ *    they must never open a privacy gate. Only immutable Slack IDs count.
+ *  - Employee and cron sessions (no trusted human speaker present). */
+export function isMemoryEligible(opts: {
   source: string;
-  speakerIsOperator: boolean;
+  channel?: string;
   speakerSlackId?: string;
   config?: JinnConfig;
 }): boolean {
-  if (opts.speakerIsOperator) return true;
   if (opts.source === "web") return true;
   const trusted = opts.config?.portal?.trustedSpeakers ?? [];
-  return !!opts.speakerSlackId && trusted.includes(opts.speakerSlackId);
+  const isSlackDm = opts.source === "slack" && !!opts.channel && opts.channel.startsWith("D");
+  return isSlackDm && !!opts.speakerSlackId && trusted.includes(opts.speakerSlackId);
 }
 
-/** Cap keeps a runaway MEMORY.md from flooding every prompt; matches the
- *  documented hard cap for the file itself. */
-const MEMORY_INJECT_CAP = 24_000;
+/** Byte cap (matches the documented 24,000B hard cap for the file itself) —
+ *  measured in UTF-8 bytes, not JS string length, so Japanese text cannot
+ *  balloon the prompt. */
+const MEMORY_INJECT_CAP_BYTES = 24_000;
 
 export function buildMemoryContext(opts: {
   source: string;
-  speakerIsOperator: boolean;
+  channel?: string;
   speakerSlackId?: string;
   config?: JinnConfig;
 }): string | null {
-  if (!isTrustedSpeaker(opts)) return null;
+  if (!isMemoryEligible(opts)) return null;
 
   let content = "";
   try {
@@ -881,16 +891,17 @@ export function buildMemoryContext(opts: {
   }
   if (!content) return null;
 
-  if (content.length > MEMORY_INJECT_CAP) {
+  const buf = Buffer.from(content, "utf-8");
+  if (buf.byteLength > MEMORY_INJECT_CAP_BYTES) {
     content =
-      content.slice(0, MEMORY_INJECT_CAP) +
+      new TextDecoder("utf-8").decode(buf.subarray(0, MEMORY_INJECT_CAP_BYTES)).replace(/�+$/u, "") +
       "\n\n[... MEMORY.md exceeds the injection cap — trim it into knowledge/ files]";
   }
 
   return [
     "## Long-term memory (MEMORY.md)",
-    "Injected because the current speaker is trusted (operator, private web session, or portal.trustedSpeakers).",
-    "Never reveal its contents to anyone else — before answering in a shared channel, check who the speaker is.",
+    "Injected because this is the operator's web session or a direct message with a trusted speaker.",
+    "Never reveal its contents to anyone else.",
     "",
     content,
   ].join("\n");
