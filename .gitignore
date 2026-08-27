@@ -12,3 +12,5 @@ dist/
 # Jinn runtime dir (safety: never commit tokens)
 .jinn/
 /docs
+# npm pack artifacts
+*.tgz
