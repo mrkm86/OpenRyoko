@@ -84,6 +84,8 @@ import { getDiskSpaceStatus } from "../shared/storage-health.js";
 import { ptySnapshotStore } from "../engines/pty-snapshot.js";
 import { collectClaudeUsage } from "../shared/claude-usage.js";
 import { PairingAttemptLimiter, pairingAttemptKey } from "./pairing-rate-limit.js";
+import { personalizeInstructionMd, personalizeIdentityMd, resolveEffectiveName } from "./onboarding-personalize.js";
+import { patchPortalSection, writeFileAtomic } from "./portal-config.js";
 
 /** Max bytes accepted on /api/internal/hook (loopback-only relay payloads are tiny). */
 const HOOK_BODY_MAX_BYTES = 64 * 1024;
@@ -2047,61 +2049,56 @@ Handle this as a priority request from a colleague.`;
       const body = _parsed.body as any;
       const { portalName, operatorName, language } = body;
 
-      // Read current config and merge portal settings
+      // Read current config and merge portal settings. Empty strings are
+      // treated as "not provided" — deleting the key would silently revert
+      // the portal to its defaults.
       const config = context.getConfig();
-      const updated = {
-        ...config,
-        portal: {
-          ...config.portal,
-          onboarded: true,
-          ...(portalName !== undefined && { portalName: portalName || undefined }),
-          ...(operatorName !== undefined && { operatorName: operatorName || undefined }),
-          ...(language !== undefined && { language: language || undefined }),
-        },
+      const provided = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+      const portalPatch: Record<string, unknown> = {
+        ...config.portal,
+        onboarded: true,
+        ...(provided(portalName) && { portalName }),
+        ...(provided(operatorName) && { operatorName }),
+        ...(provided(language) && { language }),
       };
+      const updated = { ...config, portal: portalPatch };
 
-      // Write updated config
-      const yamlStr = yaml.dump(updated, { lineWidth: -1 });
-      fs.writeFileSync(CONFIG_PATH, yamlStr);
+      // Patch only the portal block — a whole-file yaml.dump would strip
+      // every comment the shipped config template carries.
+      const rawConfig = fs.existsSync(CONFIG_PATH) ? fs.readFileSync(CONFIG_PATH, "utf-8") : "";
+      writeFileAtomic(CONFIG_PATH, patchPortalSection(rawConfig, portalPatch));
       logger.info(`Onboarding: portal name="${portalName}", operator="${operatorName}", language="${language}"`);
 
-      const effectiveName = portalName || "Ryoko";
+      const effectiveName = resolveEffectiveName(portalName, config.portal?.portalName);
       const languageSection = language && language !== "English"
         ? `\n\n## Language\nAlways respond in ${language}. All communication with the user must be in ${language}.`
         : "";
 
-      // Update CLAUDE.md with personalized COO name and language
-      const claudeMdPath = path.join(JINN_HOME, "CLAUDE.md");
-      if (fs.existsSync(claudeMdPath)) {
-        let claudeMd = fs.readFileSync(claudeMdPath, "utf-8");
-        // Replace the identity line in CLAUDE.md
-        claudeMd = claudeMd.replace(
-          /^You are \w+, the COO of the user's AI organization\.$/m,
-          `You are ${effectiveName}, the COO of the user's AI organization.`,
-        );
-        // Remove existing language section if present, then add new one if needed
-        claudeMd = claudeMd.replace(/\n\n## Language\nAlways respond in .+\. All communication with the user must be in .+\./m, "");
-        if (languageSection) {
-          claudeMd = claudeMd.trimEnd() + languageSection + "\n";
+      // Update CLAUDE.md / AGENTS.md: language section always; the name only
+      // when this request actually carries one (a language-only update must
+      // not rename a customized assistant back to the default).
+      for (const filename of ["CLAUDE.md", "AGENTS.md"]) {
+        const mdPath = path.join(JINN_HOME, filename);
+        if (!fs.existsSync(mdPath)) continue;
+        let md = fs.readFileSync(mdPath, "utf-8");
+        if (provided(portalName)) {
+          md = personalizeInstructionMd(md, effectiveName);
         }
-        fs.writeFileSync(claudeMdPath, claudeMd);
+        // Remove existing language section if present, then add new one if needed
+        md = md.replace(/\n\n## Language\nAlways respond in .+\. All communication with the user must be in .+\./m, "");
+        if (languageSection) {
+          md = md.trimEnd() + languageSection + "\n";
+        }
+        writeFileAtomic(mdPath, md);
       }
 
-      // Update AGENTS.md with personalized name and language
-      const agentsMdPath = path.join(JINN_HOME, "AGENTS.md");
-      if (fs.existsSync(agentsMdPath)) {
-        let agentsMd = fs.readFileSync(agentsMdPath, "utf-8");
-        // Replace the bold identity line (e.g. "You are **Jinn**")
-        agentsMd = agentsMd.replace(
-          /You are \*\*\w+\*\*/,
-          `You are **${effectiveName}**`,
+      // Keep the persona file's Name section in sync
+      const identityMdPath = path.join(JINN_HOME, "IDENTITY.md");
+      if (provided(portalName) && fs.existsSync(identityMdPath)) {
+        writeFileAtomic(
+          identityMdPath,
+          personalizeIdentityMd(fs.readFileSync(identityMdPath, "utf-8"), effectiveName),
         );
-        // Remove existing language section if present, then add new one if needed
-        agentsMd = agentsMd.replace(/\n\n## Language\nAlways respond in .+\. All communication with the user must be in .+\./m, "");
-        if (languageSection) {
-          agentsMd = agentsMd.trimEnd() + languageSection + "\n";
-        }
-        fs.writeFileSync(agentsMdPath, agentsMd);
       }
 
       context.emit("config:updated", { portal: updated.portal });

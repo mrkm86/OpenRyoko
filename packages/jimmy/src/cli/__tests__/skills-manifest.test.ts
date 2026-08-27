@@ -22,6 +22,8 @@ import {
   writeManifest,
   upsertManifest,
   removeFromManifest,
+  isValidSource,
+  sanitizeFindQuery,
   SKILLS_JSON,
 } from "../skills.js";
 
@@ -91,6 +93,9 @@ describe("skills.json manifest", () => {
       JSON.stringify({
         installed: {
           evil: { source: "owner/repo@x; echo PWNED > /tmp/pwned.txt", installedAt: "t" },
+          dot: { source: "./repo", installedAt: "t" },
+          dotdot: { source: "../repo", installedAt: "t" },
+          hidden: { source: ".hidden/repo", installedAt: "t" },
           fine: { source: "owner/repo@skill", installedAt: "t" },
           repo: { source: "owner/repo", installedAt: "t" },
         },
@@ -98,6 +103,9 @@ describe("skills.json manifest", () => {
     );
     const byName = Object.fromEntries(readManifest().map((e) => [e.name, e.source]));
     expect(byName.evil).toBe("");
+    expect(byName.dot).toBe("");
+    expect(byName.dotdot).toBe("");
+    expect(byName.hidden).toBe("");
     expect(byName.fine).toBe("owner/repo@skill");
     expect(byName.repo).toBe("owner/repo");
   });
@@ -141,6 +149,19 @@ describe("skills.json manifest", () => {
     const written = lastWrittenJson();
     expect(written.installed.a.version).toBe("1.2.3");
     expect(written.installed.b.source).toBe("own/rep@b");
+  });
+
+  it("validates CLI-provided sources and sanitizes find queries (win32 shell:true path)", () => {
+    expect(isValidSource("owner/repo@skill")).toBe(true);
+    expect(isValidSource("owner/repo")).toBe(true);
+    expect(isValidSource("owner/repo@x; echo PWNED")).toBe(false);
+    expect(isValidSource("a & calc")).toBe(false);
+    expect(isValidSource("../repo")).toBe(false);
+    expect(sanitizeFindQuery("ios swift xcode")).toBe("ios swift xcode");
+    expect(sanitizeFindQuery("react & del /q *")).toBe("react del /q");
+    expect(sanitizeFindQuery('foo" | calc')).toBe("foo calc");
+    expect(sanitizeFindQuery("動画生成 スライド")).toBe("動画生成 スライド");
+    expect(sanitizeFindQuery("動画 & del")).toBe("動画 del");
   });
 
   it("removeFromManifest keeps unrelated entries and top-level fields", () => {
