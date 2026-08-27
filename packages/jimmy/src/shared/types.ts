@@ -493,6 +493,11 @@ export interface PortalConfig {
   operatorAliases?: string[];
   language?: string;
   onboarded?: boolean;
+  /** Slack user IDs whose sessions may receive MEMORY.md in the system prompt
+   *  even in shared channels. MEMORY holds the operator's personal facts, so
+   *  this is a privacy gate: operator + private web sessions are always
+   *  trusted; everyone else must be listed here explicitly. */
+  trustedSpeakers?: string[];
 }
 
 // --- Model + capability registry ---

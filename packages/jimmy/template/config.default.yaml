@@ -92,6 +92,14 @@ cron:
   # alertConnector: slack
   # alertChannel: "#alerts"
 
+# portal.trustedSpeakers = MEMORY.md（長期記憶）を共有チャンネルでも注入してよい
+# 「信頼話者」の Slack ID リスト。オペレータ本人と private web セッションは常に信頼扱い。
+# 載せた相手はどのチャンネルでもオーナーの個人情報を含む MEMORY を前提に会話できるため、
+# 本当に信頼できるメンバーだけを入れる。記入例:
+#   trustedSpeakers:
+#     - U0XXXXXXX   # 表示名（所属・関係のメモ）
+# 注意: portal ブロックの内側にはコメントを書かない（Web オンボーディングの
+# 部分書き換えがブロックを再生成するため、内側のコメントは保持されない）。
 portal:
   portalName: Ryoko
   language: Japanese

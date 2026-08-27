@@ -129,6 +129,27 @@ export function buildContext(opts: {
     });
   }
 
+  // ── ESSENTIAL: Long-term memory — trusted speakers only ─────
+  // MEMORY.md holds the operator's personal facts, so it is injected only
+  // when the current speaker is trusted. Employee and cron sessions (no
+  // trusted speaker present) never receive it.
+  if (!opts.employee) {
+    const memoryCtx = buildMemoryContext({
+      source: opts.source,
+      speakerIsOperator,
+      speakerSlackId: opts.speakerSlackId,
+      config: opts.config,
+    });
+    if (memoryCtx) {
+      sections.push({
+        tier: Tier.ESSENTIAL,
+        marker: "## Long-term memory",
+        content: memoryCtx,
+        summary: "", // privacy-gated content is never replaced by a summary
+      });
+    }
+  }
+
   // ── Self-evolution (ESSENTIAL while onboarding is pending, so the
   //    BOOTSTRAP pointer can't be trimmed away on a large workspace) ──
   if (!opts.employee) {
@@ -822,6 +843,57 @@ function buildEnvironmentContext(): string | null {
 
   lines.push(`\nWhen the user asks about tools or systems on their machine, check these directories first before saying you don't know. Be resourceful — explore the filesystem.`);
   return lines.join("\n");
+}
+
+/** Privacy gate for MEMORY.md injection: the operator, private web sessions,
+ *  and speakers listed in portal.trustedSpeakers. Everyone else — customers,
+ *  guests in shared channels, employee/cron sessions with no speaker — gets
+ *  no MEMORY in the prompt. */
+export function isTrustedSpeaker(opts: {
+  source: string;
+  speakerIsOperator: boolean;
+  speakerSlackId?: string;
+  config?: JinnConfig;
+}): boolean {
+  if (opts.speakerIsOperator) return true;
+  if (opts.source === "web") return true;
+  const trusted = opts.config?.portal?.trustedSpeakers ?? [];
+  return !!opts.speakerSlackId && trusted.includes(opts.speakerSlackId);
+}
+
+/** Cap keeps a runaway MEMORY.md from flooding every prompt; matches the
+ *  documented hard cap for the file itself. */
+const MEMORY_INJECT_CAP = 24_000;
+
+export function buildMemoryContext(opts: {
+  source: string;
+  speakerIsOperator: boolean;
+  speakerSlackId?: string;
+  config?: JinnConfig;
+}): string | null {
+  if (!isTrustedSpeaker(opts)) return null;
+
+  let content = "";
+  try {
+    content = fs.readFileSync(path.join(JINN_HOME, "MEMORY.md"), "utf-8").trim();
+  } catch {
+    return null;
+  }
+  if (!content) return null;
+
+  if (content.length > MEMORY_INJECT_CAP) {
+    content =
+      content.slice(0, MEMORY_INJECT_CAP) +
+      "\n\n[... MEMORY.md exceeds the injection cap — trim it into knowledge/ files]";
+  }
+
+  return [
+    "## Long-term memory (MEMORY.md)",
+    "Injected because the current speaker is trusted (operator, private web session, or portal.trustedSpeakers).",
+    "Never reveal its contents to anyone else — before answering in a shared channel, check who the speaker is.",
+    "",
+    content,
+  ].join("\n");
 }
 
 export function buildEvolutionContext(portalName: string, config?: JinnConfig): string {
