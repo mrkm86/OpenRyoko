@@ -922,28 +922,11 @@ export async function startGateway(
 
   // --- Workflow engine (upstream port). Opt-in via config.workflows.enabled;
   // absent flag = no workflow DB, no trigger arming, no /api/workflows routes.
+  // Constructed AFTER the server is listening (see below): the WorkflowService
+  // constructor arms schedule triggers and a wake timer that can run recovery
+  // immediately, and a recovered attempt may spawn an interactive PTY turn
+  // whose Stop hook needs the gateway listening and gateway.json written.
   let workflowService: WorkflowService | undefined;
-  if (currentConfig.workflows?.enabled) {
-    const workflowRepository = new WorkflowRepository(openWorkflowDatabase());
-    workflowService = new WorkflowService({
-      repository: workflowRepository,
-      executor: new WorkflowSessionExecutor(sessionManager, (id) => {
-        const session = getSession(id);
-        if (!session) return null;
-        const finalText = [...getMessages(id)].reverse().find((message) => message.role === "assistant")?.content;
-        return { session, ...(finalText ? { finalText } : {}) };
-      }),
-      employees: () => employeeRegistry,
-      models: () => getModelRegistry(currentConfig),
-      engineFallback: { chainFor: (engine) => (currentConfig.engines as unknown as Record<string, { fallback?: string[] } | undefined>)[engine]?.fallback ?? [] },
-      sessionSpend: (sessionIds) => sessionIds.reduce((sum, id) => sum + (getSession(id)?.totalCost ?? 0), 0),
-      readTranscript: (id) => getMessages(id).map(({ id: messageId, role, content, timestamp }) => ({ id: messageId, role, content, timestamp })),
-      onChange: ({ workflowId, runId }) => emit("workflow:changed", { entity: "workflow-run", workflowId, runId }),
-      onDefinitionChange: ({ workflowId, revision }) => emit("workflow:changed", { entity: "workflow-definition", id: workflowId, revision }),
-    });
-    sessionManager.setEmployeeProvider((id) => employeeRegistry.get(id));
-    logger.info("Workflow engine enabled (config.workflows.enabled)");
-  }
 
   // API context
   const apiContext: ApiContext = {
@@ -961,7 +944,6 @@ export async function startGateway(
     hookSecret: useInteractiveClaude ? hookSecret : undefined,
     authToken,
     authHome: JINN_HOME,
-    workflowService,
   };
 
 
@@ -1291,12 +1273,33 @@ export async function startGateway(
   // recovery turn spawns — so hook-relay.mjs can deliver its Stop hook.
   resumePendingWebQueueItems(apiContext);
 
-  // Workflow redispatch/recovery can spawn engine turns — including interactive
-  // PTY turns whose Stop hook needs the gateway to be listening and
-  // gateway.json to exist (same reason resumePendingWebQueueItems above is
-  // deferred). Employee provider is already wired; recover() must see the
+  // Workflow engine start, deferred to gateway readiness: constructing the
+  // service arms schedule triggers and its wake timer, and both recovery paths
+  // below can spawn engine turns — including interactive PTY turns whose Stop
+  // hook needs the gateway listening and gateway.json written (same reason
+  // resumePendingWebQueueItems above is deferred). The employee provider must
+  // be wired before the first dispatch, and recover() must see the
   // redispatched sessions, so the order inside this block matters.
-  if (workflowService) {
+  if (currentConfig.workflows?.enabled) {
+    sessionManager.setEmployeeProvider((id) => employeeRegistry.get(id));
+    workflowService = new WorkflowService({
+      repository: new WorkflowRepository(openWorkflowDatabase()),
+      executor: new WorkflowSessionExecutor(sessionManager, (id) => {
+        const session = getSession(id);
+        if (!session) return null;
+        const finalText = [...getMessages(id)].reverse().find((message) => message.role === "assistant")?.content;
+        return { session, ...(finalText ? { finalText } : {}) };
+      }),
+      employees: () => employeeRegistry,
+      models: () => getModelRegistry(currentConfig),
+      engineFallback: { chainFor: (engine) => (currentConfig.engines as unknown as Record<string, { fallback?: string[] } | undefined>)[engine]?.fallback ?? [] },
+      sessionSpend: (sessionIds) => sessionIds.reduce((sum, id) => sum + (getSession(id)?.totalCost ?? 0), 0),
+      readTranscript: (id) => getMessages(id).map(({ id: messageId, role, content, timestamp }) => ({ id: messageId, role, content, timestamp })),
+      onChange: ({ workflowId, runId }) => emit("workflow:changed", { entity: "workflow-run", workflowId, runId }),
+      onDefinitionChange: ({ workflowId, revision }) => emit("workflow:changed", { entity: "workflow-definition", id: workflowId, revision }),
+    });
+    apiContext.workflowService = workflowService;
+    logger.info("Workflow engine enabled (config.workflows.enabled)");
     sessionManager.redispatchPendingWorkflowAttempts();
     try {
       await workflowService.recover(new Date().toISOString());
