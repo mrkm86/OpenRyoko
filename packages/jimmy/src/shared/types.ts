@@ -493,6 +493,16 @@ export interface PortalConfig {
   operatorAliases?: string[];
   language?: string;
   onboarded?: boolean;
+  /** Slack user IDs whose DIRECT MESSAGES may receive MEMORY.md in the
+   *  system prompt (list the operator's own ID here too). This is a privacy
+   *  gate keyed on immutable IDs only — display names are spoofable. Web
+   *  sessions are always eligible; shared channels never are. */
+  trustedSpeakers?: string[];
+  /** The operator's own Slack user ID. When set, operator identification is
+   *  strict ID equality and display-name matching is disabled — a speaker
+   *  merely named like the operator is never asserted to BE the operator.
+   *  Strongly recommended wherever the workspace has untrusted members. */
+  operatorSlackId?: string;
 }
 
 // --- Model + capability registry ---

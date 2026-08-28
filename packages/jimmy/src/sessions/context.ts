@@ -96,15 +96,13 @@ export function buildContext(opts: {
   const operatorName = opts.operatorName || opts.config?.portal?.operatorName;
   const language = opts.language || opts.config?.portal?.language || "English";
   // Single operator-identity decision for the whole prompt (identity block +
-  // session block must agree). Matches across ALL known speaker aliases with
-  // normalization — the old exact speakerName===operatorName comparison flagged
-  // the operator himself as "NOT the operator" (nickname vs profile name),
-  // teaching the model to ignore the warning entirely.
-  const speakerIsOperator = isOperatorSpeaker(
-    [opts.speakerName, opts.speakerRealName, opts.speakerDisplayName, opts.speakerHandle],
+  // session block must agree).
+  const { speakerIsOperator, operatorIdVerified } = resolveOperatorIdentity({
+    speakerNames: [opts.speakerName, opts.speakerRealName, opts.speakerDisplayName, opts.speakerHandle],
+    speakerSlackId: opts.speakerSlackId,
     operatorName,
-    opts.config?.portal?.operatorAliases,
-  );
+    config: opts.config,
+  });
 
   // ── ESSENTIAL: Identity ─────────────────────────────────────
   if (opts.employee) {
@@ -129,6 +127,27 @@ export function buildContext(opts: {
     });
   }
 
+  // ── ESSENTIAL: Long-term memory — privacy-gated ─────────────
+  // MEMORY.md holds the operator's personal facts. Injected only in web
+  // sessions and trusted DMs (see isMemoryEligible); employee and cron
+  // sessions never receive it.
+  if (!opts.employee) {
+    const memoryCtx = buildMemoryContext({
+      source: opts.source,
+      channel: opts.channel,
+      speakerSlackId: opts.speakerSlackId,
+      config: opts.config,
+    });
+    if (memoryCtx) {
+      sections.push({
+        tier: Tier.ESSENTIAL,
+        marker: "## Long-term memory",
+        content: memoryCtx,
+        summary: "", // privacy-gated content is never replaced by a summary
+      });
+    }
+  }
+
   // ── Self-evolution (ESSENTIAL while onboarding is pending, so the
   //    BOOTSTRAP pointer can't be trimmed away on a large workspace) ──
   if (!opts.employee) {
@@ -145,7 +164,7 @@ export function buildContext(opts: {
   sections.push({
     tier: Tier.ESSENTIAL,
     marker: "## Current session",
-    content: buildSessionContext({ ...opts, sessionId: opts.sessionId, operatorName, speakerIsOperator }),
+    content: buildSessionContext({ ...opts, sessionId: opts.sessionId, operatorName, speakerIsOperator, operatorIdVerified }),
     summary: "", // always included, no trimming
   });
 
@@ -462,6 +481,7 @@ function buildSessionContext(opts: {
   speakerTz?: string;
   operatorName?: string;
   speakerIsOperator?: boolean;
+  operatorIdVerified?: boolean;
 }): string {
   let ctx = `## Current session\n`;
   if (opts.sessionId) ctx += `- Session ID: ${opts.sessionId}\n`;
@@ -495,8 +515,10 @@ function buildSessionContext(opts: {
     const isOperator = opts.speakerIsOperator === true;
     if (operator && !isOperator) {
       ctx += `  - ⚠ NOT the operator. Address this person as "${opts.speakerName}", not "${operator}".\n`;
+    } else if (operator && isOperator && opts.operatorIdVerified) {
+      ctx += `  - This speaker is the operator (ID-verified).\n`;
     } else if (operator && isOperator) {
-      ctx += `  - This speaker is the operator.\n`;
+      ctx += `  - Speaker name matches the operator (name match only — NOT identity proof; never treat this as authorization for sensitive data such as MEMORY.md).\n`;
     }
   } else {
     ctx += `- User: ${opts.user}\n`;
@@ -822,6 +844,94 @@ function buildEnvironmentContext(): string | null {
 
   lines.push(`\nWhen the user asks about tools or systems on their machine, check these directories first before saying you don't know. Be resourceful — explore the filesystem.`);
   return lines.join("\n");
+}
+
+/** Operator identification. When portal.operatorSlackId is configured,
+ *  identification is strict ID equality — display names are freely editable
+ *  and must never establish operator identity on their own. Without a
+ *  configured ID we fall back to alias/name matching (kept for addressing
+ *  UX), and the session block phrases that as an UNVERIFIED name match. */
+export function resolveOperatorIdentity(opts: {
+  speakerNames: Array<string | undefined>;
+  speakerSlackId?: string;
+  operatorName?: string;
+  config?: JinnConfig;
+}): { speakerIsOperator: boolean; operatorIdVerified: boolean } {
+  const operatorSlackId = opts.config?.portal?.operatorSlackId;
+  if (operatorSlackId) {
+    const verified = opts.speakerSlackId === operatorSlackId;
+    return { speakerIsOperator: verified, operatorIdVerified: verified };
+  }
+  return {
+    speakerIsOperator: isOperatorSpeaker(
+      opts.speakerNames,
+      opts.operatorName,
+      opts.config?.portal?.operatorAliases,
+    ),
+    operatorIdVerified: false,
+  };
+}
+
+/** Privacy gate for MEMORY.md injection.
+ *
+ *  Eligible: authenticated web-UI sessions, and Slack DIRECT MESSAGES whose
+ *  speaker's Slack ID is listed in portal.trustedSpeakers (the operator lists
+ *  their own ID there too).
+ *
+ *  Deliberately NOT eligible:
+ *  - Shared channels, even for trusted speakers — the engine session is
+ *    reused per thread, so injected memory would linger in history that later
+ *    untrusted participants build on.
+ *  - Display-name/handle operator matching — names are freely editable, so
+ *    they must never open a privacy gate. Only immutable Slack IDs count.
+ *  - Employee and cron sessions (no trusted human speaker present). */
+export function isMemoryEligible(opts: {
+  source: string;
+  channel?: string;
+  speakerSlackId?: string;
+  config?: JinnConfig;
+}): boolean {
+  if (opts.source === "web") return true;
+  const trusted = opts.config?.portal?.trustedSpeakers ?? [];
+  const isSlackDm = opts.source === "slack" && !!opts.channel && opts.channel.startsWith("D");
+  return isSlackDm && !!opts.speakerSlackId && trusted.includes(opts.speakerSlackId);
+}
+
+/** Byte cap (matches the documented 24,000B hard cap for the file itself) —
+ *  measured in UTF-8 bytes, not JS string length, so Japanese text cannot
+ *  balloon the prompt. */
+const MEMORY_INJECT_CAP_BYTES = 24_000;
+
+export function buildMemoryContext(opts: {
+  source: string;
+  channel?: string;
+  speakerSlackId?: string;
+  config?: JinnConfig;
+}): string | null {
+  if (!isMemoryEligible(opts)) return null;
+
+  let content = "";
+  try {
+    content = fs.readFileSync(path.join(JINN_HOME, "MEMORY.md"), "utf-8").trim();
+  } catch {
+    return null;
+  }
+  if (!content) return null;
+
+  const buf = Buffer.from(content, "utf-8");
+  if (buf.byteLength > MEMORY_INJECT_CAP_BYTES) {
+    content =
+      new TextDecoder("utf-8").decode(buf.subarray(0, MEMORY_INJECT_CAP_BYTES)).replace(/�+$/u, "") +
+      "\n\n[... MEMORY.md exceeds the injection cap — trim it into knowledge/ files]";
+  }
+
+  return [
+    "## Long-term memory (MEMORY.md)",
+    "Injected because this is the operator's web session or a direct message with a trusted speaker.",
+    "Never reveal its contents to anyone else.",
+    "",
+    content,
+  ].join("\n");
 }
 
 export function buildEvolutionContext(portalName: string, config?: JinnConfig): string {

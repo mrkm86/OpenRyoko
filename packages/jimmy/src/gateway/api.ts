@@ -2569,7 +2569,10 @@ async function runWebSession(
   try {
 
     const systemPrompt = buildContext({
-      source: "web",
+      // Preserve the session's true origin — labeling everything "web" here
+      // would grant web-level trust (MEMORY injection) to Slack/cron-origin
+      // sessions driven through this runner.
+      source: currentSession.source || "web",
       channel: currentSession.sourceRef,
       user: "web-user",
       employee,

@@ -92,6 +92,21 @@ cron:
   # alertConnector: slack
   # alertChannel: "#alerts"
 
+# portal.operatorSlackId = オペレータ本人の Slack ID。設定すると本人確認が ID の
+# 厳密一致になり、表示名の一致では「オペレータ本人」と扱われなくなる（表示名は
+# 誰でも変更できるため、信頼できないメンバーがいるワークスペースでは必ず設定する）。
+#   operatorSlackId: U0XXXXXXX
+#
+# portal.trustedSpeakers = MEMORY.md（長期記憶）を DM で注入してよい「信頼話者」の
+# Slack ID リスト。オペレータ本人の ID も必ずここに入れる（表示名は偽装できるため、
+# 名前ではなく不変の Slack ID だけがゲートを通る）。
+# 注入されるのは private web セッションと、ここに載る相手との DM のみ。
+# 共有チャンネルでは誰が話していても注入されない（スレッドのセッションは参加者を
+# またいで再利用されるため、一度注入した記憶が履歴に残るのを防ぐ）。記入例:
+#   trustedSpeakers:
+#     - U0XXXXXXX   # 表示名（所属・関係のメモ）
+# 注意: portal ブロックの内側にはコメントを書かない（Web オンボーディングの
+# 部分書き換えがブロックを再生成するため、内側のコメントは保持されない）。
 portal:
   portalName: Ryoko
   language: Japanese
