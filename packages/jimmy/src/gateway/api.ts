@@ -80,6 +80,9 @@ import {
   shouldRequireGatewayAuth,
   verifyGatewayAuth,
 } from "./auth.js";
+import { handleWorkflowApi } from "./workflow-api.js";
+import type { WorkflowService } from "../workflows/service.js";
+import { shouldRequireGatewayAuth as workflowAuthRequired, verifyGatewayAuth as workflowVerifyAuth } from "./auth.js";
 import { getDiskSpaceStatus } from "../shared/storage-health.js";
 import { ptySnapshotStore } from "../engines/pty-snapshot.js";
 import { collectClaudeUsage } from "../shared/claude-usage.js";
@@ -132,6 +135,8 @@ export interface ApiContext {
   hookSecret?: string;
   authToken?: string;
   authHome?: string;
+  /** Present only when config.workflows.enabled — carries the Workflow engine. */
+  workflowService?: WorkflowService;
 }
 
 export function resumePendingWebQueueItems(context: ApiContext): void {
@@ -476,6 +481,16 @@ export async function handleApiRequest(
   const method = req.method || "GET";
 
   try {
+    // /api/workflows/** — the Workflow engine (upstream port). Routed before the
+    // flat routes below; handleWorkflowApi returns false for everything else.
+    if (context.workflowService && pathname.startsWith("/api/workflows")) {
+      const authenticated = !workflowAuthRequired(context.getConfig())
+        || Boolean(context.authToken && context.authHome
+          && workflowVerifyAuth(req.headers, context.authToken, context.authHome));
+      if (await handleWorkflowApi(req, res, { method, pathname, url },
+        { service: context.workflowService, authenticated })) return;
+    }
+
     // POST /api/internal/hook — receive Claude Code turn hooks from hook-relay.mjs
     // (interactive PTY engine). Loopback-only + shared-secret authenticated.
     if (method === "POST" && pathname === "/api/internal/hook") {

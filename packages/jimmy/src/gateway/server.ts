@@ -25,6 +25,12 @@ import { writeGatewayInfo } from "./gateway-info.js";
 import { cleanupSessionSettings, seedTrust } from "../shared/claude-settings.js";
 import { GATEWAY_INFO_FILE, HOOK_RELAY_SCRIPT, CLAUDE_SETTINGS_DIR, JINN_HOME } from "../shared/paths.js";
 import { handleApiRequest, resumePendingWebQueueItems, type ApiContext } from "./api.js";
+import { openWorkflowDatabase } from "../workflows/repository-migrations.js";
+import { WorkflowRepository } from "../workflows/repository.js";
+import { WorkflowService } from "../workflows/service.js";
+import { WorkflowSessionExecutor } from "../workflows/session-executor.js";
+import { getMessages } from "../sessions/registry.js";
+import { getModelRegistry } from "../shared/models.js";
 import { ensureFilesDir } from "./files.js";
 import { ensureOwnerOnlyDirectory } from "../shared/owner-only.js";
 import {
@@ -906,6 +912,32 @@ export async function startGateway(
   // status:"running" with no live turn (see status-reconciler.ts).
   const stopStatusReconciler = startStatusReconciler({ engines, emit });
 
+  // --- Workflow engine (upstream port). Opt-in via config.workflows.enabled;
+  // absent flag = no workflow DB, no trigger arming, no /api/workflows routes.
+  let workflowService: WorkflowService | undefined;
+  if (currentConfig.workflows?.enabled) {
+    const workflowRepository = new WorkflowRepository(openWorkflowDatabase());
+    workflowService = new WorkflowService({
+      repository: workflowRepository,
+      executor: new WorkflowSessionExecutor(sessionManager, (id) => {
+        const session = getSession(id);
+        if (!session) return null;
+        const finalText = [...getMessages(id)].reverse().find((message) => message.role === "assistant")?.content;
+        return { session, ...(finalText ? { finalText } : {}) };
+      }),
+      employees: () => employeeRegistry,
+      models: () => getModelRegistry(currentConfig),
+      engineFallback: { chainFor: (engine) => (currentConfig.engines as unknown as Record<string, { fallback?: string[] } | undefined>)[engine]?.fallback ?? [] },
+      sessionSpend: (sessionIds) => sessionIds.reduce((sum, id) => sum + (getSession(id)?.totalCost ?? 0), 0),
+      readTranscript: (id) => getMessages(id).map(({ id: messageId, role, content, timestamp }) => ({ id: messageId, role, content, timestamp })),
+      onChange: ({ workflowId, runId }) => emit("workflow:changed", { entity: "workflow-run", workflowId, runId }),
+      onDefinitionChange: ({ workflowId, revision }) => emit("workflow:changed", { entity: "workflow-definition", id: workflowId, revision }),
+    });
+    sessionManager.setEmployeeProvider((id) => employeeRegistry.get(id));
+    sessionManager.redispatchPendingWorkflowAttempts();
+    logger.info("Workflow engine enabled (config.workflows.enabled)");
+  }
+
   // API context
   const apiContext: ApiContext = {
     config: currentConfig,
@@ -922,6 +954,7 @@ export async function startGateway(
     hookSecret: useInteractiveClaude ? hookSecret : undefined,
     authToken,
     authHome: JINN_HOME,
+    workflowService,
   };
 
   // NOTE: replaying pending web queue items is deferred until AFTER the server is
@@ -1303,6 +1336,9 @@ export async function startGateway(
       claudeEngine.killAll();
     }
     codexEngine.killAll();
+
+    // Stop workflow triggers/runner before cron
+    try { workflowService?.dispose(); } catch { /* best effort */ }
 
     // Stop cron scheduler
     stopScheduler();

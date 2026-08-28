@@ -6,7 +6,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { SESSIONS_DB } from '../shared/paths.js';
 import { logger } from '../shared/logger.js';
 import { assertDiskSpaceForWrite } from '../shared/storage-health.js';
-import type { JsonObject, ReplyContext, Session } from '../shared/types.js';
+import type {
+  JsonObject,
+  ReplyContext,
+  Session,
+  SessionAttemptOutcome,
+  WorkflowAttemptInterruptionCause,
+  WorkflowSessionProvenance,
+} from '../shared/types.js';
 
 let db: Database.Database;
 let ftsAvailable = true;
@@ -200,8 +207,16 @@ function rowToSession(row: Record<string, unknown>): Session {
     model: (row.model as string) ?? null,
     title: (row.title as string) ?? null,
     parentSessionId: (row.parent_session_id as string) ?? null,
+    workflowProvenance: row.workflow_provenance
+      ? (parseJsonObject(row.workflow_provenance) as unknown as WorkflowSessionProvenance | null)
+      : null,
     effortLevel: (row.effort_level as string) ?? null,
     status: row.status as Session['status'],
+    attemptOutcome: (row.attempt_outcome as SessionAttemptOutcome) ?? null,
+    attemptTerminalVersion: (row.attempt_terminal_version as number) ?? 0,
+    attemptTurn: (row.attempt_turn as number) ?? 0,
+    attemptInterruptionCause: (row.attempt_interruption_cause as WorkflowAttemptInterruptionCause) ?? null,
+    attemptInterruptionTurn: (row.attempt_interruption_turn as number) ?? null,
     totalCost: (row.total_cost as number) ?? 0,
     totalTurns: (row.total_turns as number) ?? 0,
     lastContextTokens: (row.last_context_tokens as number) ?? null,
@@ -234,7 +249,8 @@ export function initDb(): Database.Database {
       position INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       started_at TEXT,
-      completed_at TEXT
+      completed_at TEXT,
+      internal INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_queue_session
       ON queue_items (session_key, status, position);
@@ -287,6 +303,18 @@ export function migrateSessionsSchema(database: Database.Database): void {
     ['total_turns', 'INTEGER', '0'],
     ['effort_level', 'TEXT'],
     ['last_context_tokens', 'INTEGER'],
+    // Workflow attempt attribution + terminal receipts (upstream port)
+    ['workflow_provenance', 'TEXT'],
+    ['workflow_kind', 'TEXT'],
+    ['workflow_id', 'TEXT'],
+    ['workflow_run_id', 'TEXT'],
+    ['workflow_phase_node_id', 'TEXT'],
+    ['workflow_phase_attempt', 'INTEGER'],
+    ['attempt_outcome', 'TEXT'],
+    ['attempt_terminal_version', 'INTEGER', '0'],
+    ['attempt_turn', 'INTEGER', '0'],
+    ['attempt_interruption_cause', 'TEXT'],
+    ['attempt_interruption_turn', 'INTEGER'],
   ];
 
   for (const [name, type, defaultVal] of missingColumns) {
@@ -304,6 +332,14 @@ export function migrateSessionsSchema(database: Database.Database): void {
   if (refreshedNames.has('connector')) {
     database.exec(`UPDATE sessions SET connector = COALESCE(connector, source) WHERE connector IS NULL OR connector = ''`);
   }
+
+  // queue_items is created after this migration runs on a fresh database (its
+  // CREATE TABLE already carries `internal`); only an existing table needs the
+  // column added.
+  const queueCols = database.prepare('PRAGMA table_info(queue_items)').all() as Array<{ name: string }>;
+  if (queueCols.length > 0 && !queueCols.some((c) => c.name === 'internal')) {
+    database.exec('ALTER TABLE queue_items ADD COLUMN internal INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 export interface CreateSessionOpts {
@@ -320,6 +356,8 @@ export interface CreateSessionOpts {
   title?: string;
   parentSessionId?: string;
   effortLevel?: string;
+  /** Durable workflow/run/phase attribution (upstream port). */
+  workflowProvenance?: WorkflowSessionProvenance;
 }
 
 function getNextSessionNumber(): number {
@@ -348,12 +386,14 @@ export function createSession(opts: CreateSessionOpts & { prompt?: string; porta
   const replyContext = opts.replyContext ? JSON.stringify(opts.replyContext) : null;
   const transportMeta = opts.transportMeta ? JSON.stringify(opts.transportMeta) : null;
 
+  const workflow = opts.workflowProvenance ?? null;
   const stmt = db.prepare(`
     INSERT INTO sessions (
       id, engine, source, source_ref, connector, session_key, reply_context, message_id, transport_meta,
-      employee, model, title, parent_session_id, effort_level, status, created_at, last_activity
+      employee, model, title, parent_session_id, effort_level, status, created_at, last_activity,
+      workflow_provenance, workflow_kind, workflow_id, workflow_run_id, workflow_phase_node_id, workflow_phase_attempt
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     id,
@@ -372,6 +412,12 @@ export function createSession(opts: CreateSessionOpts & { prompt?: string; porta
     opts.effortLevel ?? null,
     now,
     now,
+    workflow ? JSON.stringify(workflow) : null,
+    workflow?.kind ?? null,
+    workflow?.workflowId ?? null,
+    workflow?.runId ?? null,
+    workflow?.phase?.nodeId ?? null,
+    workflow?.phase?.attempt ?? null,
   );
 
   return {
@@ -389,8 +435,14 @@ export function createSession(opts: CreateSessionOpts & { prompt?: string; porta
     model: opts.model ?? null,
     title,
     parentSessionId: opts.parentSessionId ?? null,
+    workflowProvenance: workflow,
     effortLevel: opts.effortLevel ?? null,
     status: 'idle',
+    attemptOutcome: null,
+    attemptTerminalVersion: 0,
+    attemptTurn: 0,
+    attemptInterruptionCause: null,
+    attemptInterruptionTurn: null,
     totalCost: 0,
     totalTurns: 0,
     lastContextTokens: null,
@@ -428,6 +480,11 @@ export interface UpdateSessionFields {
   lastError?: string | null;
   title?: string;
   lastContextTokens?: number | null;
+  attemptOutcome?: SessionAttemptOutcome | null;
+  attemptTerminalVersion?: number;
+  attemptTurn?: number;
+  attemptInterruptionCause?: WorkflowAttemptInterruptionCause | null;
+  attemptInterruptionTurn?: number | null;
 }
 
 export function updateSession(id: string, updates: UpdateSessionFields): Session | undefined {
@@ -442,6 +499,26 @@ export function updateSession(id: string, updates: UpdateSessionFields): Session
   if (updates.engineSessionId !== undefined) {
     sets.push('engine_session_id = ?');
     values.push(updates.engineSessionId);
+  }
+  if (updates.attemptOutcome !== undefined) {
+    sets.push('attempt_outcome = ?');
+    values.push(updates.attemptOutcome);
+  }
+  if (updates.attemptTerminalVersion !== undefined) {
+    sets.push('attempt_terminal_version = ?');
+    values.push(updates.attemptTerminalVersion);
+  }
+  if (updates.attemptTurn !== undefined) {
+    sets.push('attempt_turn = ?');
+    values.push(updates.attemptTurn);
+  }
+  if (updates.attemptInterruptionCause !== undefined) {
+    sets.push('attempt_interruption_cause = ?');
+    values.push(updates.attemptInterruptionCause);
+  }
+  if (updates.attemptInterruptionTurn !== undefined) {
+    sets.push('attempt_interruption_turn = ?');
+    values.push(updates.attemptInterruptionTurn);
   }
   if (updates.status !== undefined) {
     sets.push('status = ?');
@@ -812,15 +889,15 @@ export interface QueueItem {
   completedAt: string | null;
 }
 
-export function enqueueQueueItem(sessionId: string, sessionKey: string, prompt: string): string {
+export function enqueueQueueItem(sessionId: string, sessionKey: string, prompt: string, opts: { internal?: boolean } = {}): string {
   const db = initDb();
   const id = randomUUID();
   const position = (db.prepare(
     "SELECT COALESCE(MAX(position), 0) + 1 as pos FROM queue_items WHERE session_key = ? AND status = 'pending'"
   ).get(sessionKey) as { pos: number }).pos;
   db.prepare(
-    "INSERT INTO queue_items (id, session_id, session_key, prompt, status, position, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)"
-  ).run(id, sessionId, sessionKey, prompt, position, new Date().toISOString());
+    "INSERT INTO queue_items (id, session_id, session_key, prompt, status, position, created_at, internal) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)"
+  ).run(id, sessionId, sessionKey, prompt, position, new Date().toISOString(), opts.internal ? 1 : 0);
   return id;
 }
 
@@ -938,4 +1015,149 @@ export function deleteFile(id: string): boolean {
   const db = initDb();
   const result = db.prepare('DELETE FROM files WHERE id = ?').run(id);
   return result.changes > 0;
+}
+
+// --- Workflow attempt sessions (upstream port, adapted to the jimmy schema) ---
+
+const QUEUE_ITEM_WIRE_SELECT =
+  "SELECT id, session_id as sessionId, session_key as sessionKey, prompt, status, position, created_at as createdAt, started_at as startedAt, completed_at as completedAt FROM queue_items";
+
+type WorkflowAttemptSessionOpts = CreateSessionOpts & { prompt?: string; workflowProvenance: WorkflowSessionProvenance };
+
+function assertWorkflowAttemptSession(session: Session, opts: WorkflowAttemptSessionOpts, key: string): void {
+  const expected = opts.workflowProvenance;
+  const actual = session.workflowProvenance;
+  const sameOwner = expected.kind === 'phase' && expected.phase && actual?.kind === 'phase' && actual.phase
+    && actual.workflowId === expected.workflowId && actual.runId === expected.runId
+    && actual.phase.nodeId === expected.phase.nodeId && actual.phase.attempt === expected.phase.attempt;
+  if (!sameOwner) throw new Error(`Workflow attempt session key collision for ${key}.`);
+  if (session.sessionKey !== key || session.sourceRef !== key) throw new Error(`Workflow attempt session key mismatch for ${key}.`);
+  const expectedConfig = [opts.engine, opts.employee ?? null, opts.model ?? null, opts.effortLevel ?? null];
+  if ([session.engine, session.employee, session.model, session.effortLevel].some((value, index) => value !== expectedConfig[index])) {
+    throw new Error(`Workflow attempt session configuration mismatch for ${key}.`);
+  }
+}
+
+/** One session row per workflow attempt, found again after a crash by its
+ *  provenance rather than created twice. */
+export function getOrCreateWorkflowAttemptSession(opts: WorkflowAttemptSessionOpts): Session {
+  const database = initDb();
+  const workflow = opts.workflowProvenance;
+  const phase = workflow.kind === 'phase' ? workflow.phase : undefined;
+  if (!phase) throw new Error('Workflow attempt sessions require phase provenance.');
+  const key = opts.sessionKey ?? opts.sourceRef;
+  const getOrCreate = database.transaction(() => {
+    const rows = database.prepare(
+      `SELECT * FROM sessions WHERE session_key = ? OR (workflow_kind = 'phase' AND workflow_id = ? AND workflow_run_id = ? AND workflow_phase_node_id = ? AND workflow_phase_attempt = ?)`
+    ).all(key, workflow.workflowId, workflow.runId, phase.nodeId, phase.attempt) as Record<string, unknown>[];
+    if (rows.length > 1) throw new Error(`Workflow attempt session key collision for ${key}.`);
+    const existing = rows[0] ? rowToSession(rows[0]) : undefined;
+    if (!existing) return createSession(opts);
+    assertWorkflowAttemptSession(existing, opts, key);
+    return existing;
+  });
+  return getOrCreate.immediate();
+}
+
+/** Terminal interruption receipt. Only a live, unsettled attempt row takes it,
+ *  so a stop that raced a completion never rewrites what already settled. */
+export function interruptSessionAttempt(id: string, reason: string, completedAt: string): Session | undefined {
+  const result = initDb().prepare(`UPDATE sessions SET status = 'interrupted', attempt_outcome = 'interrupted',
+    attempt_terminal_version = 1, attempt_turn = attempt_turn + 1, last_activity = ?, last_error = ?,
+    attempt_interruption_cause = NULL, attempt_interruption_turn = NULL
+    WHERE id = ? AND workflow_kind = 'phase' AND attempt_outcome IS NULL AND attempt_terminal_version = 0`)
+    .run(completedAt, reason, id);
+  return result.changes === 1 ? getSession(id) : undefined;
+}
+
+export function listChildSessions(parentSessionId: string): Session[] {
+  const rows = initDb().prepare('SELECT * FROM sessions WHERE parent_session_id = ?')
+    .all(parentSessionId) as Record<string, unknown>[];
+  return rows.map(rowToSession);
+}
+
+/** Claim the one internal dispatch slot of an idle workflow attempt session.
+ *  Returns the queue item id to run under, or null when the slot is taken. */
+export function claimWorkflowAttemptDispatch(sessionId: string, sessionKey: string, prompt: string): string | null {
+  const db = initDb();
+  return db.transaction(() => {
+    const session = db.prepare(`SELECT id FROM sessions WHERE id = ? AND session_key = ?
+      AND workflow_kind = 'phase' AND status = 'idle'
+      AND (attempt_outcome IS NULL OR attempt_outcome = 'succeeded')`).get(sessionId, sessionKey);
+    if (!session) return null;
+    const existing = db.prepare(
+      `${QUEUE_ITEM_WIRE_SELECT} WHERE session_id = ? AND internal = 1 AND status IN ('pending', 'running') ORDER BY created_at, position LIMIT 1`
+    ).get(sessionId) as (QueueItem & { sessionKey: string }) | undefined;
+    if (existing && (existing.sessionKey !== sessionKey || existing.prompt !== prompt)) {
+      throw new Error(`Workflow session ${sessionId} dispatch claim does not match its immutable command.`);
+    }
+    if (existing?.status === 'running') return null;
+    return existing?.id ?? enqueueQueueItem(sessionId, sessionKey, prompt, { internal: true });
+  }).immediate();
+}
+
+export function cancelWorkflowAttemptDispatch(sessionId: string): number {
+  return initDb().prepare(
+    `UPDATE queue_items SET status = 'cancelled' WHERE session_id = ? AND internal = 1 AND status IN ('pending', 'running')`
+  ).run(sessionId).changes;
+}
+
+/** Pending internal dispatches whose attempt session can still run them —
+ *  what a restarting gateway replays. */
+export function listPendingWorkflowAttemptDispatches(): QueueItem[] {
+  return initDb().prepare(`${QUEUE_ITEM_WIRE_SELECT} WHERE status = 'pending' AND internal = 1
+    AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = queue_items.session_id
+      AND sessions.workflow_kind = 'phase' AND sessions.status = 'idle'
+      AND (sessions.attempt_outcome IS NULL OR sessions.attempt_outcome = 'succeeded'))
+    ORDER BY created_at, position`).all() as QueueItem[];
+}
+
+/** Record the engine-native session id an attempt should resume from. The
+ *  fork tracks one engineSessionId per session, so the record only lands when
+ *  the engine matches the session's own. */
+export function recordEngineSessionId(sessionId: string, engine: string, nativeId: string): Session | undefined {
+  const session = getSession(sessionId);
+  if (!session) return undefined;
+  if (session.engine !== engine) return session;
+  return updateSession(sessionId, { engineSessionId: nativeId }) ?? session;
+}
+
+/** Settle workflow attempts whose engine process was lost with the old gateway.
+ *  The `gateway-restart` cause is what lets the runtime replace the attempt
+ *  rather than spend its retry budget (see workflows/restart-redispatch.ts). */
+export function recoverStaleWorkflowAttemptSessions(): number {
+  const database = initDb();
+  const now = new Date().toISOString();
+  return database.transaction(() => {
+    database.prepare(`
+      UPDATE queue_items
+      SET status = 'cancelled'
+      WHERE internal = 1
+        AND status IN ('pending', 'running')
+        AND EXISTS (
+          SELECT 1
+          FROM sessions
+          WHERE sessions.id = queue_items.session_id
+            AND sessions.status = 'running'
+            AND sessions.workflow_kind = 'phase'
+            AND sessions.attempt_outcome IS NULL
+            AND sessions.attempt_terminal_version = 0
+        )
+    `).run();
+    return database.prepare(`
+      UPDATE sessions
+      SET status = 'interrupted',
+        attempt_outcome = 'interrupted',
+        attempt_terminal_version = 1,
+        attempt_turn = MAX(attempt_turn, 1),
+        attempt_interruption_cause = 'gateway-restart',
+        attempt_interruption_turn = MAX(attempt_turn, 1),
+        last_activity = ?,
+        last_error = 'Interrupted: gateway restarted while workflow attempt was running'
+      WHERE status = 'running'
+        AND workflow_kind = 'phase'
+        AND attempt_outcome IS NULL
+        AND attempt_terminal_version = 0
+    `).run(now).changes;
+  }).immediate();
 }

@@ -52,8 +52,27 @@ function resolveHome(): string {
  * installs and after the one-time migration above.
  */
 export const JINN_HOME = resolveHome();
+
+// Fail closed if a test run resolves to a real, non-temp home. Vitest sets
+// VITEST in every worker; a suite that reaches here without the global-setup
+// redirect would silently read and WRITE the production registry.
+if (process.env.VITEST && (
+  JINN_HOME === path.join(os.homedir(), ".ryoko") || JINN_HOME === path.join(os.homedir(), ".jinn")
+)) {
+  throw new Error(
+    `Test run resolved JINN_HOME to the real home (${JINN_HOME}). `
+    + "The vitest globalSetup must redirect RYOKO_HOME to a temp directory before any import.",
+  );
+}
+
+/** Upstream-parity alias: resolve the (possibly overridden) home directory. */
+export function resolveJinnHome(): string {
+  return resolveHome();
+}
 export const CONFIG_PATH = path.join(JINN_HOME, "config.yaml");
 export const SESSIONS_DB = path.join(JINN_HOME, "sessions", "registry.db");
+export const WORKFLOWS_DIR = path.join(JINN_HOME, "workflows");
+export const WORKFLOWS_DB_PATH = path.join(WORKFLOWS_DIR, "workflows.db");
 export const CRON_JOBS = path.join(JINN_HOME, "cron", "jobs.json");
 export const CRON_RUNS = path.join(JINN_HOME, "cron", "runs");
 export const UPDATE_STATE = path.join(JINN_HOME, "updates", "state.json");
