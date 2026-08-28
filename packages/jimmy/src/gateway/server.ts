@@ -10,7 +10,7 @@ import type { JinnConfig, Connector, Employee } from "../shared/types.js";
 import { loadConfig } from "../shared/config.js";
 import { invalidateModelRegistry } from "../shared/models.js";
 import { configureLogger, logger } from "../shared/logger.js";
-import { initDb, scheduleFtsBackfill, recoverStaleSessions, recoverStaleWorkflowAttemptSessions, recoverStaleQueueItems, getInterruptedSessions, interruptSessionAttempt, listSessions, updateSession, getSession } from "../sessions/registry.js";
+import { initDb, scheduleFtsBackfill, recoverStaleSessions, recoverStaleWorkflowAttemptSessions, recoverStaleQueueItems, getInterruptedSessions, listSessions, updateSession, getSession } from "../sessions/registry.js";
 import { SessionManager, type RouteOptions } from "../sessions/manager.js";
 import { ClaudeEngine } from "../engines/claude.js";
 import { CodexEngine } from "../engines/codex.js";
@@ -964,18 +964,7 @@ export async function startGateway(
     workflowService,
   };
 
-  if (workflowService) {
-    // Replay internal dispatches a restart left pending, then let the runtime
-    // recover its own runs (dispatching attempts, receipts whose completion
-    // event was lost, due waits). Order matters: the employee provider is
-    // already wired above, and recover() must see the redispatched sessions.
-    sessionManager.redispatchPendingWorkflowAttempts();
-    try {
-      await workflowService.recover(new Date().toISOString());
-    } catch (error) {
-      logger.error(`Workflow recovery failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
+
 
   // NOTE: replaying pending web queue items is deferred until AFTER the server is
   // listening and gateway.json (port + hook secret) has been written — otherwise an
@@ -1302,6 +1291,20 @@ export async function startGateway(
   // recovery turn spawns — so hook-relay.mjs can deliver its Stop hook.
   resumePendingWebQueueItems(apiContext);
 
+  // Workflow redispatch/recovery can spawn engine turns — including interactive
+  // PTY turns whose Stop hook needs the gateway to be listening and
+  // gateway.json to exist (same reason resumePendingWebQueueItems above is
+  // deferred). Employee provider is already wired; recover() must see the
+  // redispatched sessions, so the order inside this block matters.
+  if (workflowService) {
+    sessionManager.redispatchPendingWorkflowAttempts();
+    try {
+      await workflowService.recover(new Date().toISOString());
+    } catch (error) {
+      logger.error(`Workflow recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   // Notify connected WebSocket clients about interrupted sessions available for resume
   if (resumable.length > 0) {
     // Small delay to let WebSocket clients connect after server starts
@@ -1346,15 +1349,19 @@ export async function startGateway(
 
     // Mark all running sessions as "interrupted" before killing engine processes.
     // This preserves their engine_session_id so they can be resumed on next startup.
+    // Workflow attempts get the SAME sweep the next boot would run: it cancels
+    // their internal queue rows and stamps the durable `gateway-restart`
+    // receipt in one transaction. A plain interrupt receipt would classify as
+    // `attempt-stop` on the next boot (workflowAttemptInterruptionCause's
+    // fallback) — an operator stop, which is not retryable — and a graceful
+    // shutdown would fail the runs it merely paused.
+    const stoppedWorkflowAttempts = recoverStaleWorkflowAttemptSessions();
+    if (stoppedWorkflowAttempts > 0) {
+      logger.info(`Marked ${stoppedWorkflowAttempts} workflow attempt(s) with gateway-restart receipts for replacement on next boot`);
+    }
     const runningSessions = listSessions({ status: "running" });
     for (const session of runningSessions) {
-      if (session.workflowProvenance?.kind === "phase") {
-        // A workflow attempt needs the durable interrupted receipt (outcome +
-        // terminal version), or the next boot's recovery cannot replace it.
-        interruptSessionAttempt(session.id, "Interrupted: gateway shutting down gracefully", new Date().toISOString());
-        logger.info(`Marked workflow attempt session ${session.id} as interrupted for replacement`);
-        continue;
-      }
+      if (session.workflowProvenance?.kind === "phase") continue; // handled by the sweep above
       updateSession(session.id, {
         status: "interrupted",
         lastActivity: new Date().toISOString(),

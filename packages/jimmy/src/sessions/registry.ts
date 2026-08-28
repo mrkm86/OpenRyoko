@@ -344,7 +344,11 @@ export function migrateSessionsSchema(database: Database.Database): void {
   // column added.
   const queueCols = database.prepare('PRAGMA table_info(queue_items)').all() as Array<{ name: string }>;
   if (queueCols.length > 0 && !queueCols.some((c) => c.name === 'internal')) {
-    database.exec('ALTER TABLE queue_items ADD COLUMN internal INTEGER NOT NULL DEFAULT 0');
+    try {
+      database.exec('ALTER TABLE queue_items ADD COLUMN internal INTEGER NOT NULL DEFAULT 0');
+    } catch (error) {
+      if (!String(error).includes('duplicate column name')) throw error;
+    }
   }
 }
 
