@@ -2,6 +2,31 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.8.29] - 2026-08-28
+
+> 上流 Jinn の Workflow 基盤を移植した（オプトイン・既定OFF）。タスクの性質に応じて「決定的判定 / 軽量モデル / Opus級」を選べるルーティング基盤の第1弾（backend core）。
+
+### このリリースでできるようになったこと
+
+- **Workflow エンジン（`config.workflows.enabled: true` でオプトイン）**: 上流 `hristo2612/jinn` の Workflow 基盤を backend core として移植。trigger 3種（manual / schedule / event）、ノード7種（Employee / Workflow Call / Condition / Merge / Approval / Wait / End）、`/api/workflows` API 一式
+- **ノード単位のモデルルーティング**: Employee ノードごとに engine / model / effort / fallback を指定でき、構造化出力 → Condition（決定的判定・LLM 不使用）で「安いモデルで判定し、必要なときだけ高性能モデルへ渡す」を表現できる
+- **外部イベント連携**: `POST /api/workflows/events/<name>`（fireId 冪等・64KiB 上限）。外部監視は OS スケジューラのスクリプトから event trigger を叩く上流方針を踏襲
+- **利用量の帰属**: run 単位で attempt / session / engine / model と `spendUsd` を追跡
+- **無効時は副作用ゼロ**: フラグ未設定なら Workflow DB 作成・trigger arming・API ルート露出のいずれも行われない。既存の Cron・Slack respond-policy・MEMORY 注入には非干渉
+
+### 移植の設計判断
+
+- Todo（work-items）サブシステムは移植せず、型互換の不活性 shim で分離。todo-status trigger / todo-comment wait を含む定義は保存時に 422 `unsupported-capability` で拒否
+- dispatch claim は CAS + 永続 claim + settle と queue close の同一トランザクション化で排他を担保。graceful shutdown は次回 boot と同一の sweep で `gateway-restart` receipt を刻む（再起動が run を失敗させない）
+- WorkflowService の構築は listen + gateway.json 書込後に延期（interactive PTY turn の Stop hook 競合を回避）
+- vitest にテストホーム隔離（globalSetup + per-worker 分離 + fail-closed ガード）を導入 — テストが実 `~/.ryoko` に触れることを構造的に防止
+
+### Verification
+
+- Backend: **144 test files / 1,650 tests pass**（Workflow 新規 811 件を含む）、tsc clean
+- Codex（gpt-5.6-sol）による4巡レビュー（マージ不可×3 → 修正 → マージ可）で HIGH 2件含む全指摘を消化
+- PR: [#55](https://github.com/rsensui2/OpenRyoko/pull/55)、評価文書: `docs/plans/2026-08-28-workflow-port-evaluation.md`
+
 ## [2026.8.28] - 2026-08-28
 
 > MEMORY.md（長期記憶）の注入がプライバシーゲート付きのコア機能になった。
