@@ -10,7 +10,7 @@ import type { JinnConfig, Connector, Employee } from "../shared/types.js";
 import { loadConfig } from "../shared/config.js";
 import { invalidateModelRegistry } from "../shared/models.js";
 import { configureLogger, logger } from "../shared/logger.js";
-import { initDb, scheduleFtsBackfill, recoverStaleSessions, recoverStaleQueueItems, getInterruptedSessions, listSessions, updateSession, getSession } from "../sessions/registry.js";
+import { initDb, scheduleFtsBackfill, recoverStaleSessions, recoverStaleWorkflowAttemptSessions, recoverStaleQueueItems, getInterruptedSessions, listSessions, updateSession, getSession } from "../sessions/registry.js";
 import { SessionManager, type RouteOptions } from "../sessions/manager.js";
 import { ClaudeEngine } from "../engines/claude.js";
 import { CodexEngine } from "../engines/codex.js";
@@ -25,6 +25,12 @@ import { writeGatewayInfo } from "./gateway-info.js";
 import { cleanupSessionSettings, seedTrust } from "../shared/claude-settings.js";
 import { GATEWAY_INFO_FILE, HOOK_RELAY_SCRIPT, CLAUDE_SETTINGS_DIR, JINN_HOME } from "../shared/paths.js";
 import { handleApiRequest, resumePendingWebQueueItems, type ApiContext } from "./api.js";
+import { openWorkflowDatabase } from "../workflows/repository-migrations.js";
+import { WorkflowRepository } from "../workflows/repository.js";
+import { WorkflowService } from "../workflows/service.js";
+import { WorkflowSessionExecutor } from "../workflows/session-executor.js";
+import { getMessages } from "../sessions/registry.js";
+import { getModelRegistry } from "../shared/models.js";
 import { ensureFilesDir } from "./files.js";
 import { ensureOwnerOnlyDirectory } from "../shared/owner-only.js";
 import {
@@ -192,6 +198,14 @@ export async function startGateway(
   const recovered = recoverStaleSessions();
   if (recovered > 0) {
     logger.info(`Recovered ${recovered} stale session(s) — marked as "interrupted" for resume`);
+  }
+  // Workflow attempt sessions get their own sweep: it stamps the durable
+  // `gateway-restart` receipt the runtime needs to REPLACE the attempt instead
+  // of spending its retry budget. recoverStaleSessions() above deliberately
+  // skips workflow_kind rows so this sweep still finds them running.
+  const recoveredWorkflowAttempts = recoverStaleWorkflowAttemptSessions();
+  if (recoveredWorkflowAttempts > 0) {
+    logger.info(`Recovered ${recoveredWorkflowAttempts} stale workflow attempt(s) — stamped gateway-restart receipts`);
   }
 
   // Log resumable sessions so operators know what can be picked up
@@ -906,6 +920,14 @@ export async function startGateway(
   // status:"running" with no live turn (see status-reconciler.ts).
   const stopStatusReconciler = startStatusReconciler({ engines, emit });
 
+  // --- Workflow engine (upstream port). Opt-in via config.workflows.enabled;
+  // absent flag = no workflow DB, no trigger arming, no /api/workflows routes.
+  // Constructed AFTER the server is listening (see below): the WorkflowService
+  // constructor arms schedule triggers and a wake timer that can run recovery
+  // immediately, and a recovered attempt may spawn an interactive PTY turn
+  // whose Stop hook needs the gateway listening and gateway.json written.
+  let workflowService: WorkflowService | undefined;
+
   // API context
   const apiContext: ApiContext = {
     config: currentConfig,
@@ -923,6 +945,8 @@ export async function startGateway(
     authToken,
     authHome: JINN_HOME,
   };
+
+
 
   // NOTE: replaying pending web queue items is deferred until AFTER the server is
   // listening and gateway.json (port + hook secret) has been written — otherwise an
@@ -1115,9 +1139,22 @@ export async function startGateway(
     onConfigReload: () => {
       try {
         const previous = currentConfig;
+        const previousWorkflowsEnabled = Boolean(currentConfig.workflows?.enabled);
         currentConfig = loadConfig();
         invalidateModelRegistry(); // rebuild the model/capability registry from the reloaded config
         apiContext.config = currentConfig;
+        // Workflow engine is boot-time wiring. Disable takes effect immediately
+        // (dispose stops schedule triggers and the runner; routes disappear with
+        // the context entry); enable requires a restart.
+        const workflowsEnabled = Boolean(currentConfig.workflows?.enabled);
+        if (previousWorkflowsEnabled && !workflowsEnabled && workflowService) {
+          try { workflowService.dispose(); } catch { /* best effort */ }
+          workflowService = undefined;
+          apiContext.workflowService = undefined;
+          logger.info("Workflow engine disabled via config reload");
+        } else if (!previousWorkflowsEnabled && workflowsEnabled && !workflowService) {
+          logger.warn("config.workflows.enabled was turned on — restart the gateway to start the Workflow engine");
+        }
         // Propagate the fresh config into SessionManager so new sessions
         // pick up edits to engines.default / portal.* / engine bin paths
         // even when the connectors block didn't change.
@@ -1236,6 +1273,41 @@ export async function startGateway(
   // recovery turn spawns — so hook-relay.mjs can deliver its Stop hook.
   resumePendingWebQueueItems(apiContext);
 
+  // Workflow engine start, deferred to gateway readiness: constructing the
+  // service arms schedule triggers and its wake timer, and both recovery paths
+  // below can spawn engine turns — including interactive PTY turns whose Stop
+  // hook needs the gateway listening and gateway.json written (same reason
+  // resumePendingWebQueueItems above is deferred). The employee provider must
+  // be wired before the first dispatch, and recover() must see the
+  // redispatched sessions, so the order inside this block matters.
+  if (currentConfig.workflows?.enabled) {
+    sessionManager.setEmployeeProvider((id) => employeeRegistry.get(id));
+    workflowService = new WorkflowService({
+      repository: new WorkflowRepository(openWorkflowDatabase()),
+      executor: new WorkflowSessionExecutor(sessionManager, (id) => {
+        const session = getSession(id);
+        if (!session) return null;
+        const finalText = [...getMessages(id)].reverse().find((message) => message.role === "assistant")?.content;
+        return { session, ...(finalText ? { finalText } : {}) };
+      }),
+      employees: () => employeeRegistry,
+      models: () => getModelRegistry(currentConfig),
+      engineFallback: { chainFor: (engine) => (currentConfig.engines as unknown as Record<string, { fallback?: string[] } | undefined>)[engine]?.fallback ?? [] },
+      sessionSpend: (sessionIds) => sessionIds.reduce((sum, id) => sum + (getSession(id)?.totalCost ?? 0), 0),
+      readTranscript: (id) => getMessages(id).map(({ id: messageId, role, content, timestamp }) => ({ id: messageId, role, content, timestamp })),
+      onChange: ({ workflowId, runId }) => emit("workflow:changed", { entity: "workflow-run", workflowId, runId }),
+      onDefinitionChange: ({ workflowId, revision }) => emit("workflow:changed", { entity: "workflow-definition", id: workflowId, revision }),
+    });
+    apiContext.workflowService = workflowService;
+    logger.info("Workflow engine enabled (config.workflows.enabled)");
+    sessionManager.redispatchPendingWorkflowAttempts();
+    try {
+      await workflowService.recover(new Date().toISOString());
+    } catch (error) {
+      logger.error(`Workflow recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   // Notify connected WebSocket clients about interrupted sessions available for resume
   if (resumable.length > 0) {
     // Small delay to let WebSocket clients connect after server starts
@@ -1280,8 +1352,19 @@ export async function startGateway(
 
     // Mark all running sessions as "interrupted" before killing engine processes.
     // This preserves their engine_session_id so they can be resumed on next startup.
+    // Workflow attempts get the SAME sweep the next boot would run: it cancels
+    // their internal queue rows and stamps the durable `gateway-restart`
+    // receipt in one transaction. A plain interrupt receipt would classify as
+    // `attempt-stop` on the next boot (workflowAttemptInterruptionCause's
+    // fallback) — an operator stop, which is not retryable — and a graceful
+    // shutdown would fail the runs it merely paused.
+    const stoppedWorkflowAttempts = recoverStaleWorkflowAttemptSessions();
+    if (stoppedWorkflowAttempts > 0) {
+      logger.info(`Marked ${stoppedWorkflowAttempts} workflow attempt(s) with gateway-restart receipts for replacement on next boot`);
+    }
     const runningSessions = listSessions({ status: "running" });
     for (const session of runningSessions) {
+      if (session.workflowProvenance?.kind === "phase") continue; // handled by the sweep above
       updateSession(session.id, {
         status: "interrupted",
         lastActivity: new Date().toISOString(),
@@ -1303,6 +1386,9 @@ export async function startGateway(
       claudeEngine.killAll();
     }
     codexEngine.killAll();
+
+    // Stop workflow triggers/runner before cron
+    try { workflowService?.dispose(); } catch { /* best effort */ }
 
     // Stop cron scheduler
     stopScheduler();

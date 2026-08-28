@@ -5,19 +5,34 @@ import type {
   Engine,
   IncomingMessage,
   JinnConfig,
+  SessionAttemptOutcome,
   Session,
   Target,
+  WorkflowAttemptCommand,
+  WorkflowAttemptCompletion,
+  WorkflowAttemptCompletionListener,
+  WorkflowAttemptInterruptionCause,
 } from "../shared/types.js";
 import {
+  cancelWorkflowAttemptDispatch,
+  claimWorkflowAttemptDispatch,
   createSession,
   deleteSession,
+  getOrCreateWorkflowAttemptSession,
   getSession,
   getSessionBySessionKey,
   getMessages,
   insertMessage,
+  interruptSessionAttempt,
+  listChildSessions,
+  listPendingWorkflowAttemptDispatches,
+  settleWorkflowAttemptDispatch,
   updateSession,
   type UpdateSessionFields,
 } from "./registry.js";
+import { isInterruptibleEngine } from "../shared/types.js";
+import { continueWorkflowAttemptSession } from "./attempt-continuation.js";
+import { workflowAttemptInterruptionCause } from "./workflow-interruptions.js";
 import { recordTurnAccounting } from "./accounting.js";
 import { notifyParentSession, notifyRateLimited, notifyRateLimitResumed, notifyDiscordChannel } from "./callbacks.js";
 import { buildContext } from "./context.js";
@@ -35,6 +50,24 @@ import { loadJobs } from "../cron/jobs.js";
 import { setCronJobEnabled, triggerCronJob } from "../cron/scheduler.js";
 import { checkBudget } from "../gateway/budgets.js";
 import { resolveMcpServers, writeMcpConfigFile, cleanupMcpConfigFile } from "../mcp/resolver.js";
+
+const WORKFLOW_CAPABILITIES = { threading: false, messageEdits: false, reactions: false, attachments: false };
+/** Inert connector a workflow attempt turn runs under: nothing to deliver to,
+ *  nothing to react on — the runner reads the transcript, not a channel. */
+const WORKFLOW_CONNECTOR: Connector = {
+  name: "workflow",
+  async start() {},
+  async stop() {},
+  getCapabilities: () => WORKFLOW_CAPABILITIES,
+  getHealth: () => ({ status: "running", capabilities: WORKFLOW_CAPABILITIES }),
+  reconstructTarget: () => ({ channel: "workflow" }),
+  async sendMessage() { return undefined; },
+  async replyMessage() { return undefined; },
+  async addReaction() {},
+  async removeReaction() {},
+  async editMessage() {},
+  onMessage() {},
+};
 
 export interface RouteOptions {
   employee?: Employee;
@@ -145,6 +178,9 @@ export class SessionManager {
   private connectorNames: string[];
   private queue = new SessionQueue();
   private connectorProvider: () => Map<string, Connector> = () => new Map();
+  private employeeProvider: (id: string) => Employee | undefined = () => undefined;
+  private workflowAttemptCompletionListeners = new Set<WorkflowAttemptCompletionListener>();
+  private emittedWorkflowAttemptCompletions = new Set<string>();
 
   constructor(
     config: JinnConfig,
@@ -158,6 +194,187 @@ export class SessionManager {
 
   setConnectorProvider(provider: () => Map<string, Connector>): void {
     this.connectorProvider = provider;
+  }
+
+  /** Wire the employee roster in after boot (mirrors setConnectorProvider). */
+  setEmployeeProvider(provider: (id: string) => Employee | undefined): void {
+    this.employeeProvider = provider;
+  }
+
+  // --- Workflow attempt execution (upstream port, adapted) -------------------
+  //
+  // Upstream fences terminal writes with per-dispatch attempt tokens; this fork
+  // relies on the queue's per-sessionKey serialization plus the persisted
+  // dispatch claim, and stamps the terminal receipt in the dispatch task right
+  // after runSession — never inside it — so the conversational path stays
+  // untouched. A stop that raced the settle wins: the receipt is only written
+  // while attemptOutcome is still null.
+
+  subscribeWorkflowAttemptCompletion(listener: WorkflowAttemptCompletionListener): () => void {
+    this.workflowAttemptCompletionListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.workflowAttemptCompletionListeners.delete(listener);
+    };
+  }
+
+  async runWorkflowAttempt(command: WorkflowAttemptCommand): Promise<{ sessionId: string }> {
+    const employee = this.employeeProvider(command.employeeId);
+    if (!employee) throw new Error(`Workflow employee "${command.employeeId}" is not available.`);
+    const key = `workflow:${command.owner.workflowId}:${command.owner.runId}:${command.owner.nodeId}:${command.owner.attempt}`;
+    const session = continueWorkflowAttemptSession(
+      getOrCreateWorkflowAttemptSession({
+        engine: command.engine,
+        source: "workflow",
+        sourceRef: key,
+        connector: "workflow",
+        sessionKey: key,
+        employee: command.employeeId,
+        model: command.model,
+        effortLevel: command.effort,
+        prompt: command.prompt,
+        workflowProvenance: {
+          kind: "phase",
+          workflowId: command.owner.workflowId,
+          workflowName: command.owner.workflowId,
+          runId: command.owner.runId,
+          triggerSource: "workflow",
+          phase: { nodeId: command.owner.nodeId, name: command.owner.nodeId, index: 1, round: 1, attempt: command.owner.attempt },
+        },
+      }),
+      command.continueFrom,
+    );
+    const claim = claimWorkflowAttemptDispatch(session.id, session.sessionKey, command.prompt);
+    if (claim) this.enqueueWorkflowAttempt(session, command.prompt, employee, claim);
+    return { sessionId: session.id };
+  }
+
+  private enqueueWorkflowAttempt(session: Session, prompt: string, employee: Employee, claim: string): void {
+    const msg: IncomingMessage = {
+      connector: "workflow", source: "workflow", sessionKey: session.sessionKey, replyContext: {},
+      channel: session.id, user: "workflow", userId: "workflow", text: prompt, attachments: [], raw: null,
+    };
+    // Emitted on the enqueue promise, never inside the task: a listener that
+    // answers the completion by dispatching again (the stop-nudge does) must
+    // find the queue row already settled, not still running this prompt.
+    setImmediate(() => {
+      let settled: Session | undefined;
+      void this.queue.enqueue(session.sessionKey, async () => {
+        // The previous terminal receipt was already cleared inside the durable
+        // claim transaction (claimWorkflowAttemptDispatch), so this turn — or a
+        // stop that races it — owns the receipt from here on.
+        try {
+          await this.runSession(session, msg, [], WORKFLOW_CONNECTOR, { channel: session.id }, employee);
+          settled = this.settleWorkflowAttemptTurn(session.id);
+        } catch (error) {
+          // A turn whose plumbing threw is a FAILED attempt, never a success:
+          // deciding success from `status === "idle"` here would let an
+          // insertMessage/context failure masquerade as a completed turn.
+          logger.error(`Workflow session ${session.id} dispatch failed: ${String(error)}`);
+          settled = settleWorkflowAttemptDispatch(session.id, "failed", { error: String(error) });
+        }
+      }, claim).then(() => {
+        if (settled) this.emitWorkflowAttemptCompletion(settled);
+      });
+    });
+  }
+
+  /** Terminal receipt for the turn runSession just ran, written atomically with
+   *  the queue-row close (see registry.settleWorkflowAttemptDispatch). A stop
+   *  that already stamped `interrupted` keeps its receipt. A turn that ended in
+   *  `waiting`/`running` (rate-limit park, still-active transport) settles
+   *  nothing — recovery or the next turn owns it. */
+  private settleWorkflowAttemptTurn(sessionId: string): Session | undefined {
+    const current = getSession(sessionId);
+    if (!current || current.workflowProvenance?.kind !== "phase") return current ?? undefined;
+    const outcome: SessionAttemptOutcome | null = current.status === "error" ? "failed"
+      : current.status === "interrupted" ? "interrupted"
+      : current.status === "idle" ? "succeeded" : null;
+    return settleWorkflowAttemptDispatch(sessionId, outcome);
+  }
+
+  async remindWorkflowAttempt(sessionId: string, text: string): Promise<void> {
+    const session = getSession(sessionId);
+    if (!session || session.workflowProvenance?.kind !== "phase" || !session.employee) {
+      throw new Error(`Workflow attempt session "${sessionId}" is not available.`);
+    }
+    const employee = this.employeeProvider(session.employee);
+    if (!employee) throw new Error(`Workflow employee "${session.employee}" is not available.`);
+    const claim = claimWorkflowAttemptDispatch(session.id, session.sessionKey, text);
+    if (!claim) throw new Error(`Workflow attempt session "${sessionId}" is not idle.`);
+    this.enqueueWorkflowAttempt(session, text, employee, claim);
+  }
+
+  workflowAttemptState(sessionId: string): { idle: boolean; runningChildren: number } | null {
+    const session = getSession(sessionId);
+    if (!session || session.workflowProvenance?.kind !== "phase") return null;
+    const idle = session.status === "idle"
+      && !this.queue.isRunning(session.sessionKey)
+      && this.queue.getPendingCount(session.sessionKey) === 0;
+    const runningChildren = listChildSessions(sessionId).filter((child) => {
+      const transport = this.queue.getTransportState(child.sessionKey, child.status);
+      return child.status === "running" || transport === "running" || transport === "queued";
+    }).length;
+    return { idle, runningChildren };
+  }
+
+  async stopWorkflowAttempt(input: { sessionId: string; reason: string }): Promise<void> {
+    const session = getSession(input.sessionId);
+    if (!session || session.workflowProvenance?.kind !== "phase") return;
+    const stopped = interruptSessionAttempt(session.id, input.reason, new Date().toISOString());
+    // Cancel the pending dispatch even when the interrupt receipt found nothing
+    // to stamp — a session whose last turn already succeeded can still hold a
+    // pending reminder row, and a stop must not leave it to run later.
+    cancelWorkflowAttemptDispatch(session.id);
+    this.queue.clearQueue(session.sessionKey);
+    if (!stopped) return;
+    const engine = this.engines.get(stopped.engine);
+    if (engine && isInterruptibleEngine(engine)) engine.kill(stopped.id, input.reason);
+    this.emitWorkflowAttemptCompletion(stopped, "attempt-stop");
+  }
+
+  /** Replay internal dispatches a restart left pending (call once at boot,
+   *  after the employee provider is wired). */
+  redispatchPendingWorkflowAttempts(): void {
+    for (const item of listPendingWorkflowAttemptDispatches()) {
+      const session = getSession(item.sessionId);
+      const employee = session?.employee ? this.employeeProvider(session.employee) : undefined;
+      if (!session || !employee) continue;
+      this.enqueueWorkflowAttempt(session, item.prompt, employee, item.id);
+    }
+  }
+
+  private emitWorkflowAttemptCompletion(session?: Session, interruptionCause?: WorkflowAttemptInterruptionCause): void {
+    const provenance = session?.workflowProvenance;
+    if (!session?.attemptOutcome || provenance?.kind !== "phase" || !provenance.phase) return;
+    const terminalVersion = session.attemptTerminalVersion ?? 0;
+    const turn = session.attemptTurn ?? 0;
+    const key = `${session.id}:${turn}`;
+    if (terminalVersion < 1 || turn < 1 || this.emittedWorkflowAttemptCompletions.has(key)) return;
+    const finalText = [...getMessages(session.id)].reverse().find((message) => message.role === "assistant")?.content;
+    const event: WorkflowAttemptCompletion = {
+      sessionId: session.id,
+      owner: {
+        workflowId: provenance.workflowId, runId: provenance.runId,
+        nodeId: provenance.phase.nodeId, attempt: provenance.phase.attempt,
+      },
+      turn,
+      terminalVersion: 1,
+      outcome: session.attemptOutcome,
+      completedAt: session.lastActivity,
+      ...(session.attemptOutcome === "interrupted" ? {
+        interruptionCause: interruptionCause ?? workflowAttemptInterruptionCause(session.lastError, session, turn),
+      } : {}),
+      ...(finalText ? { finalText } : {}),
+      ...(session.lastError ? { error: session.lastError } : {}),
+    };
+    this.emittedWorkflowAttemptCompletions.add(key);
+    for (const listener of this.workflowAttemptCompletionListeners) {
+      void Promise.resolve(listener(event)).catch((error) =>
+        logger.error(`Workflow attempt completion listener failed: ${String(error)}`));
+    }
   }
 
   /**

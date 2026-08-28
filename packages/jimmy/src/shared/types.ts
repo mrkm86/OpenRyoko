@@ -158,6 +158,40 @@ export interface Target {
   replyContext?: ReplyContext;
 }
 
+// --- Workflow attempt contract (ported from upstream jinn) ---
+
+export type SessionAttemptOutcome = "succeeded" | "failed" | "interrupted";
+export type WorkflowAttemptInterruptionCause = "user-message" | "attempt-stop" | "gateway-restart";
+export interface WorkflowAttemptContinuation { engine: string; engineSessionId: string; sourceSessionId: string }
+export interface WorkflowAttemptCommand { owner: { workflowId: string; runId: string; nodeId: string; attempt: number }; employeeId: string; engine: string; model?: string; effort?: "low" | "medium" | "high" | "xhigh"; prompt: string; continueFrom?: WorkflowAttemptContinuation }
+export interface WorkflowAttemptCompletion { sessionId: string; owner: { workflowId: string; runId: string; nodeId: string; attempt: number }; turn: number; terminalVersion: number; outcome: "succeeded" | "failed" | "interrupted"; interruptionCause?: WorkflowAttemptInterruptionCause; finalText?: string; error?: string; completedAt: string }
+export type WorkflowAttemptCompletionListener = (event: WorkflowAttemptCompletion) => void | Promise<void>;
+export interface WorkflowSessionExecutor {
+  startAttempt(command: WorkflowAttemptCommand): Promise<{ sessionId: string }>;
+  stopAttempt(input: { sessionId: string; reason: string }): Promise<void>;
+  remind(input: { sessionId: string; text: string }): Promise<void>;
+  attemptState(sessionId: string): { idle: boolean; runningChildren: number } | null;
+}
+
+/** Durable attribution for a workflow-owned employee attempt session. */
+export interface WorkflowSessionProvenance {
+  kind: "phase";
+  workflowId: string;
+  /** Canonical agent-facing workflow name (definition.name, falling back to id). */
+  workflowName: string;
+  runId: string;
+  /** Uniform workflow trigger source: manual, schedule, event-webhook, etc. */
+  triggerSource: string;
+  phase: {
+    nodeId: string;
+    name: string;
+    /** One-based position in the run's frozen execution order. */
+    index: number;
+    round: number;
+    attempt: number;
+  };
+}
+
 export interface Session {
   id: string;
   engine: string;
@@ -173,7 +207,19 @@ export interface Session {
   model: string | null;
   title: string | null;
   parentSessionId: string | null;
+  /** Explicit workflow/run/phase attribution for grouping and filtered reads. */
+  workflowProvenance?: WorkflowSessionProvenance | null;
   status: "idle" | "running" | "error" | "waiting" | "interrupted";
+  /** Durable terminal receipt for the latest execution attempt. Conversational
+   * `idle` alone is never proof that work completed successfully. */
+  attemptOutcome?: SessionAttemptOutcome | null;
+  /** Monotonic terminal-receipt version within the current attempt generation. */
+  attemptTerminalVersion?: number;
+  /** Monotonic count of completed turns in a workflow attempt session. */
+  attemptTurn?: number;
+  /** Durable interruption classification recorded before an engine is killed. */
+  attemptInterruptionCause?: WorkflowAttemptInterruptionCause | null;
+  attemptInterruptionTurn?: number | null;
   effortLevel: string | null;
   totalCost: number;
   totalTurns: number;
@@ -505,6 +551,17 @@ export interface PortalConfig {
   operatorSlackId?: string;
 }
 
+// --- Engine quota/limit snapshots ---
+
+export interface EngineLimitWindow {
+  name: string;
+  usedPercent?: number;
+  windowDurationMins?: number;
+  /** Unix timestamp in seconds. */
+  resetsAt?: number;
+  resetsAtIso?: string;
+}
+
 // --- Model + capability registry ---
 // Single source of truth for which engines/models exist and what they support.
 // Shipping a NEW model is a config edit (`models:` block in config.yaml), zero
@@ -596,13 +653,24 @@ export interface JinnConfig {
        *  Default 5400000 (90 min) — accommodates long autonomous batch runs that
        *  legitimately occupy one turn (e.g. the seminar-demo generator). */
       interactiveTurnTimeoutMs?: number;
+      /** Ordered engine names to try when this engine is unavailable (upstream chain spec). */
+      fallback?: ("claude" | "codex" | "gemini")[];
+      /** Pinned-model → substitute-model map applied when swapping engines. */
+      fallbackModelMap?: Record<string, string>;
     };
-    codex: { bin: string; model: string; effortLevel?: string; childEffortOverride?: string };
-    gemini?: { bin: string; model: string; effortLevel?: string; childEffortOverride?: string };
+    codex: { bin: string; model: string; effortLevel?: string; childEffortOverride?: string; fallback?: ("claude" | "codex" | "gemini")[]; fallbackModelMap?: Record<string, string> };
+    gemini?: { bin: string; model: string; effortLevel?: string; childEffortOverride?: string; fallback?: ("claude" | "codex" | "gemini")[]; fallbackModelMap?: Record<string, string> };
   };
   /** Optional model/capability registry override. Absent → synthesized from
    *  `engines.<name>.model`. See shared/models.ts. */
   models?: ModelsConfig;
+  /** Workflow engine (ported from upstream jinn). Opt-in: absent/false = no
+   *  workflow service, no schedule arming, no workflow API. */
+  workflows?: {
+    enabled?: boolean;
+    /** Canonical git remote/branch a landing-evidence check verifies against. */
+    delivery?: { remote?: string; branch?: string };
+  };
   connectors: Record<string, any> & {
     web?: WebConnectorConfig;
     slack?: SlackConnectorConfig;
