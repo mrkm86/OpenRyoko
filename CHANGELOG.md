@@ -2,6 +2,28 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.8.28] - 2026-08-28
+
+> MEMORY.md（長期記憶）の注入がプライバシーゲート付きのコア機能になった。
+
+### このリリースでできるようになったこと
+
+- **長期記憶が実際に効くようになった**: これまで MEMORY.md はコードでは注入されず、テンプレート CLAUDE.md の `@MEMORY.md` import（Claude エンジンのみ・話者を問わず）だけが頼りだった。gateway が **private web セッションと、`portal.trustedSpeakers` に載る相手との DM に限り** MEMORY.md を system prompt に注入する
+- **共有チャンネルでは誰が話していても注入されない**: スレッドのセッションは参加者をまたいで再利用されるため、一度注入した記憶が履歴に残るのを構造的に防ぐ。cron・employee セッションにも注入されない
+- **`portal.operatorSlackId`**: 設定するとオペレータ本人確認が Slack ID の厳密一致になり、表示名の一致では本人扱いされない（表示名は誰でも変更できるため、信頼できないメンバーがいるワークスペースでは必ず設定を推奨）。未設定時の名前一致は「name match only — NOT identity proof」と明示される
+- **既存インスタンス向けマイグレーション**: `ryoko migrate` が既存 CLAUDE.md の `@MEMORY.md` import（新ゲートの迂回路）を除去し、記憶セクションの記述を新仕様に更新する
+
+### Security
+
+- セッションの source を web に固定していた実行経路を修正（Slack/cron 起源のセッションが web 扱いで注入対象になる迂回を遮断）
+- 注入キャップを UTF-8 バイト基準に（日本語テキストで文書化済み上限 24,000B を大幅超過できた）
+
+### Verification
+
+- Backend: **103 test files / 833 tests pass**（+11: 共有チャンネル拒否・なりすまし・source 偽装・バイトキャップ等）
+- Codex（gpt-5.6-sol）による4巡の敵対的レビューで CRITICAL 2件含む全指摘を消化、最終 VERDICT: OK
+- PR: [#54](https://github.com/rsensui2/OpenRyoko/pull/54)
+
 ## [2026.8.27] - 2026-08-27
 
 > 新規セットアップ体験の総点検リリース。config テンプレート・skills.json・メモリ指示・同梱 docs・Web オンボーディングの不整合をまとめて修正し、Codex + 独立レビュアーによる多段レビューで発覚したセキュリティ問題も解消。
