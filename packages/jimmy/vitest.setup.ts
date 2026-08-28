@@ -12,7 +12,12 @@ import path from 'node:path';
  */
 const base = process.env.JINN_HOME;
 if (base) {
-  const workerHome = path.join(base, `w-${process.pid}`);
+  // Pool ID first: under a threads pool every worker shares one PID, so PID
+  // alone would collapse the isolation this file exists to provide. The PID
+  // stays as a suffix so the forks pool (isolate: true — a fresh fork per test
+  // file) also separates sequential files that reuse a pool slot.
+  const worker = `${process.env.VITEST_POOL_ID ?? '0'}-${process.pid}`;
+  const workerHome = path.join(base, `w-${worker}`);
   fs.mkdirSync(workerHome, { recursive: true });
   process.env.JINN_HOME = workerHome;
 }

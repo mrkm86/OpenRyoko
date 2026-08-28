@@ -134,6 +134,23 @@ function fullRunDetail(detail: WorkflowRunDetail, spendUsd: number): WorkflowRun
   return { ...detail, attempts: withoutAttemptInput(detail), spendUsd };
 }
 
+/** Fork adaptation (see the PUT handler below): the node kinds that need the
+ *  unported Todo subsystem, reported by name so the author knows what to drop. */
+function unsupportedTodoCapability(definition: Record<string, unknown>): string | undefined {
+  const nodes = Array.isArray(definition.nodes) ? definition.nodes : [];
+  for (const node of nodes) {
+    if (typeof node !== "object" || node === null) continue;
+    const { type, config } = node as { type?: unknown; config?: { kind?: unknown; mode?: unknown } };
+    if (type === "trigger" && config?.kind === "todo-status") {
+      return "todo-status triggers need the Todo (work-items) subsystem, which this build does not include.";
+    }
+    if (type === "wait" && config?.mode === "todo-comment") {
+      return "todo-comment waits need the Todo (work-items) subsystem, which this build does not include.";
+    }
+  }
+  return undefined;
+}
+
 async function definitions(req: IncomingMessage, res: ServerResponse, url: URL, parts: string[], options: WorkflowApiOptions): Promise<boolean> {
   const { service } = options; const method = req.method ?? "GET";
   if (parts.length === 2 && method === "GET") { send(res, 200, service.listDefinitions(definitionQuery(url))); return true; }
@@ -146,6 +163,12 @@ async function definitions(req: IncomingMessage, res: ServerResponse, url: URL, 
   if (parts.length === 3 && method === "PUT") {
     const parsed = await body(req, res); if (parsed === undefined) return true;
     const value = record(parsed, ["definition", "expectedRevision"]); const definition = plainObject(value.definition, "Workflow definition is invalid.");
+    // Fork adaptation: OpenRyoko has not ported the Todo (work-items) subsystem,
+    // so a todo-status trigger would never fire and a todo-comment wait could
+    // never resume. Refuse to SAVE them rather than let a definition look armed
+    // while silently dead. Remove this guard when work-items lands.
+    const unsupported = unsupportedTodoCapability(definition);
+    if (unsupported) { send(res, 422, { code: "unsupported-capability", message: unsupported }); return true; }
     send(res, 200, service.saveDefinition({ ...definition, id } as never, value.expectedRevision as number)); return true;
   }
   if (parts.length === 4 && parts[3] === "duplicate" && method === "POST") {

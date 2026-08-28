@@ -26,6 +26,7 @@ import {
   interruptSessionAttempt,
   listChildSessions,
   listPendingWorkflowAttemptDispatches,
+  settleWorkflowAttemptDispatch,
   updateSession,
   type UpdateSessionFields,
 } from "./registry.js";
@@ -261,15 +262,18 @@ export class SessionManager {
     setImmediate(() => {
       let settled: Session | undefined;
       void this.queue.enqueue(session.sessionKey, async () => {
+        // The previous terminal receipt was already cleared inside the durable
+        // claim transaction (claimWorkflowAttemptDispatch), so this turn — or a
+        // stop that races it — owns the receipt from here on.
         try {
-          // A new dispatch opens a new attempt generation: clear the previous
-          // terminal receipt so the settle below (or a stop) owns this turn.
-          updateSession(session.id, { attemptOutcome: null, attemptTerminalVersion: 0 });
           await this.runSession(session, msg, [], WORKFLOW_CONNECTOR, { channel: session.id }, employee);
           settled = this.settleWorkflowAttemptTurn(session.id);
         } catch (error) {
+          // A turn whose plumbing threw is a FAILED attempt, never a success:
+          // deciding success from `status === "idle"` here would let an
+          // insertMessage/context failure masquerade as a completed turn.
           logger.error(`Workflow session ${session.id} dispatch failed: ${String(error)}`);
-          settled = this.settleWorkflowAttemptTurn(session.id);
+          settled = settleWorkflowAttemptDispatch(session.id, "failed", { error: String(error) });
         }
       }, claim).then(() => {
         if (settled) this.emitWorkflowAttemptCompletion(settled);
@@ -277,19 +281,18 @@ export class SessionManager {
     });
   }
 
-  /** Terminal receipt for the turn runSession just ran. A stop that already
-   *  stamped `interrupted` keeps its receipt; this only fills a null one. */
+  /** Terminal receipt for the turn runSession just ran, written atomically with
+   *  the queue-row close (see registry.settleWorkflowAttemptDispatch). A stop
+   *  that already stamped `interrupted` keeps its receipt. A turn that ended in
+   *  `waiting`/`running` (rate-limit park, still-active transport) settles
+   *  nothing — recovery or the next turn owns it. */
   private settleWorkflowAttemptTurn(sessionId: string): Session | undefined {
     const current = getSession(sessionId);
     if (!current || current.workflowProvenance?.kind !== "phase") return current ?? undefined;
-    if (current.attemptOutcome) return current;
-    const outcome: SessionAttemptOutcome = current.status === "error" ? "failed"
-      : current.status === "interrupted" ? "interrupted" : "succeeded";
-    return updateSession(sessionId, {
-      attemptOutcome: outcome,
-      attemptTerminalVersion: 1,
-      attemptTurn: (current.attemptTurn ?? 0) + 1,
-    }) ?? current;
+    const outcome: SessionAttemptOutcome | null = current.status === "error" ? "failed"
+      : current.status === "interrupted" ? "interrupted"
+      : current.status === "idle" ? "succeeded" : null;
+    return settleWorkflowAttemptDispatch(sessionId, outcome);
   }
 
   async remindWorkflowAttempt(sessionId: string, text: string): Promise<void> {
@@ -321,9 +324,12 @@ export class SessionManager {
     const session = getSession(input.sessionId);
     if (!session || session.workflowProvenance?.kind !== "phase") return;
     const stopped = interruptSessionAttempt(session.id, input.reason, new Date().toISOString());
+    // Cancel the pending dispatch even when the interrupt receipt found nothing
+    // to stamp — a session whose last turn already succeeded can still hold a
+    // pending reminder row, and a stop must not leave it to run later.
+    cancelWorkflowAttemptDispatch(session.id);
+    this.queue.clearQueue(session.sessionKey);
     if (!stopped) return;
-    cancelWorkflowAttemptDispatch(stopped.id);
-    this.queue.clearQueue(stopped.sessionKey);
     const engine = this.engines.get(stopped.engine);
     if (engine && isInterruptibleEngine(engine)) engine.kill(stopped.id, input.reason);
     this.emitWorkflowAttemptCompletion(stopped, "attempt-stop");

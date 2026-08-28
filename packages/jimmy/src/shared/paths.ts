@@ -53,15 +53,14 @@ function resolveHome(): string {
  */
 export const JINN_HOME = resolveHome();
 
-// Fail closed if a test run resolves to a real, non-temp home. Vitest sets
-// VITEST in every worker; a suite that reaches here without the global-setup
-// redirect would silently read and WRITE the production registry.
-if (process.env.VITEST && (
-  JINN_HOME === path.join(os.homedir(), ".ryoko") || JINN_HOME === path.join(os.homedir(), ".jinn")
-)) {
+// Fail closed if a test run resolves into the user's home directory at all —
+// that covers ~/.ryoko, ~/.jinn, and every custom instance home (TBCare-style
+// installs included). Vitest sets VITEST in every worker; a legitimate test
+// home always lives under the OS temp directory.
+if (process.env.VITEST && (JINN_HOME === os.homedir() || JINN_HOME.startsWith(os.homedir() + path.sep))) {
   throw new Error(
-    `Test run resolved JINN_HOME to the real home (${JINN_HOME}). `
-    + "The vitest globalSetup must redirect RYOKO_HOME to a temp directory before any import.",
+    `Test run resolved JINN_HOME inside the real home directory (${JINN_HOME}). `
+    + "The vitest globalSetup must redirect JINN_HOME to a temp directory before any import.",
   );
 }
 

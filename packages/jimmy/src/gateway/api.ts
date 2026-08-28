@@ -1703,6 +1703,7 @@ Handle this as a priority request from a colleague.`;
         "mcp",
         "sessions",
         "cron",
+        "workflows",
         "notifications",
         "portal",
         "context",

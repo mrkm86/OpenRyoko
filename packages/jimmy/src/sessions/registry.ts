@@ -320,7 +320,13 @@ export function migrateSessionsSchema(database: Database.Database): void {
   for (const [name, type, defaultVal] of missingColumns) {
     if (!colNames.has(name)) {
       const defaultClause = defaultVal !== undefined ? ` DEFAULT ${defaultVal}` : '';
-      database.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}${defaultClause}`);
+      try {
+        database.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}${defaultClause}`);
+      } catch (error) {
+        // Two processes racing the same migration both observe "column missing";
+        // the loser's ALTER must not abort startup once the column exists.
+        if (!String(error).includes('duplicate column name')) throw error;
+      }
     }
   }
 
@@ -632,7 +638,7 @@ export function recoverStaleSessions(): number {
   const db = initDb();
   const now = new Date().toISOString();
   const result = db.prepare(
-    "UPDATE sessions SET status = 'interrupted', last_activity = ?, last_error = 'Interrupted: gateway restarted while session was running' WHERE status = 'running'",
+    "UPDATE sessions SET status = 'interrupted', last_activity = ?, last_error = 'Interrupted: gateway restarted while session was running' WHERE status = 'running' AND workflow_kind IS NULL",
   ).run(now);
   return result.changes;
 }
@@ -916,10 +922,18 @@ export function insertNotificationWithQueueItem(sessionId: string, sessionKey: s
   return tx();
 }
 
-export function markQueueItemRunning(itemId: string): void {
+/** pending→running の CAS。勝者のみ true — 敗者はそのプロンプトを実行してはならない。 */
+export function markQueueItemRunning(itemId: string): boolean {
   const db = initDb();
-  db.prepare("UPDATE queue_items SET status = 'running', started_at = ? WHERE id = ?")
-    .run(new Date().toISOString(), itemId);
+  return db.prepare("UPDATE queue_items SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'")
+    .run(new Date().toISOString(), itemId).changes === 1;
+}
+
+export function getQueueItem(itemId: string): QueueItem | undefined {
+  const db = initDb();
+  return db.prepare(
+    "SELECT id, session_id as sessionId, session_key as sessionKey, prompt, status, position, created_at as createdAt, started_at as startedAt, completed_at as completedAt FROM queue_items WHERE id = ?"
+  ).get(itemId) as QueueItem | undefined;
 }
 
 export function markQueueItemCompleted(itemId: string): void {
@@ -1092,7 +1106,12 @@ export function claimWorkflowAttemptDispatch(sessionId: string, sessionKey: stri
       throw new Error(`Workflow session ${sessionId} dispatch claim does not match its immutable command.`);
     }
     if (existing?.status === 'running') return null;
-    return existing?.id ?? enqueueQueueItem(sessionId, sessionKey, prompt, { internal: true });
+    const itemId = existing?.id ?? enqueueQueueItem(sessionId, sessionKey, prompt, { internal: true });
+    // 新しい dispatch generation の開始を claim と同じ transaction で durable に:
+    // 前ターンの terminal receipt をここでクリアするので、pending row が存在する間は
+    // 「outcome が刻まれていれば settle 済み」という不変式が成り立つ。
+    db.prepare("UPDATE sessions SET attempt_outcome = NULL, attempt_terminal_version = 0 WHERE id = ?").run(sessionId);
+    return itemId;
   }).immediate();
 }
 
@@ -1159,5 +1178,33 @@ export function recoverStaleWorkflowAttemptSessions(): number {
         AND attempt_outcome IS NULL
         AND attempt_terminal_version = 0
     `).run(now).changes;
+  }).immediate();
+}
+
+/** Terminal receipt for the turn a workflow dispatch just ran, written in the
+ *  same transaction that closes the internal queue row — so a crash can never
+ *  leave "receipt says succeeded, queue row still pending" for a restart to
+ *  re-execute. A stop that already stamped `interrupted` keeps its receipt
+ *  (only a null outcome is filled), but the queue row is closed either way. */
+export function settleWorkflowAttemptDispatch(
+  sessionId: string,
+  outcome: SessionAttemptOutcome | null,
+  opts: { error?: string } = {},
+): Session | undefined {
+  const database = initDb();
+  return database.transaction(() => {
+    const current = getSession(sessionId);
+    if (!current || current.workflowProvenance?.kind !== 'phase') return current ?? undefined;
+    database.prepare(
+      "UPDATE queue_items SET status = 'completed', completed_at = ? WHERE session_id = ? AND internal = 1 AND status IN ('pending', 'running')"
+    ).run(new Date().toISOString(), sessionId);
+    if (current.attemptOutcome) return current;
+    if (outcome === null) return current;
+    return updateSession(sessionId, {
+      attemptOutcome: outcome,
+      attemptTerminalVersion: 1,
+      attemptTurn: (current.attemptTurn ?? 0) + 1,
+      ...(opts.error !== undefined ? { status: 'error' as const, lastError: opts.error, lastActivity: new Date().toISOString() } : {}),
+    }) ?? current;
   }).immediate();
 }
