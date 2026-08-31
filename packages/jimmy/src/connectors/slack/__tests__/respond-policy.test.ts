@@ -212,4 +212,11 @@ describe("shouldHandleReaction", () => {
     // the channel scope only, matching the pre-existing behavior.
     expect(shouldHandleReaction({ im: "never", channel: "always" }, "D123")).toBe(true);
   });
+
+  it("treats a group DM (G…) as channel scope, not mpim — the conservative side", () => {
+    // reaction_added has no channel_type; only "D…" is distinguishable, so a
+    // group DM follows the channel scope exactly like a public channel.
+    expect(shouldHandleReaction({ channel: "mention" }, "G123")).toBe(false);
+    expect(shouldHandleReaction({ channel: "always" }, "G123")).toBe(true);
+  });
 });

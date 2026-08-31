@@ -2,6 +2,27 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.9.1] - 2026-08-31
+
+> 初回セットアップが「動くところまで」になった。名前を入れたら、エンジンの起動確認 → Slack をその場で検証して接続 → 最初の自動化を選ぶ、で Ryoko が仕事を始められる。
+
+### このリリースでできるようになったこと
+
+- **オンボーディング再設計**（/onboarding）: 名前 → エンジン確認 → Slack 接続 → 最初の自動化 → 完了。完了後は「自動化」ページの作成パネルが開いた状態で始まる（`/cron?create=<templateId>`）
+- **エンジンの起動確認を自動化**: Claude / Codex が **このマシンで起動できるか**（インストール・認証切れ）をプローブして表示。「設定してあるはずなのに動かない」を最初のステップで潰す
+- **Slack 接続を 1 操作に**: トークンを Slack に問い合わせて検証してから保存し、コネクタを再起動。失敗したら以前の設定に戻し、**戻せたかどうかも正直に表示**（ディスク／稼働の別）
+- **config 書込の安全化**: 設定 API と Slack 接続の書込を直列化し、rollback 前に外部変更を検出（`withConfigLock` + CAS）。設定ファイル watcher の自己書込抑止をカウンタ化
+
+### 同梱した修正（別スレッド）
+
+- Slack `respondTo.channel` が `mention` / `never` のとき、チャンネルの絵文字リアクションも処理しない（複数 Bot 同居で二重反応していた。グループDM は channel スコープ側に倒す）— PR #63
+
+### Verification
+
+- Backend: **150 test files / 1,720 tests pass**（engines / slack-verify / slack-connect の API テストを新設。rollback 失敗・out-of-band 変更・同時 connect の直列化を含む）、tsc clean（jimmy/web）、web build 成功
+- Codex（gpt-5.6）5巡レビュー（マージ不可×4 → 全指摘消化 → マージ可）。PR #63 も Codex マージ可（提案のテストを追加）
+- PR: [#64](https://github.com/rsensui2/OpenRyoko/pull/64)（本体）、[#63](https://github.com/rsensui2/OpenRyoko/pull/63)（取り込み）
+
 ## [2026.8.31] - 2026-08-31
 
 > Workflow に「顔」がついた。cron と Workflow をひとつの「自動化」ページで扱い、テンプレートの穴埋めだけで作れる。AI エージェントは CLI から同じことができる。
