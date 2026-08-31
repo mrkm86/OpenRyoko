@@ -3448,10 +3448,19 @@ interface SlackConnectResult {
   ok: boolean;
   stage?: "verify" | "reload";
   error?: string;
-  /** True only when the previous Slack block is back on disk AND its
-   *  connector came back up. */
+  /** What was on disk before this attempt: an existing Slack block, or none.
+   *  Tells the caller what a rollback means here — "the old connection is
+   *  back" vs "the attempt was undone and Slack is unconfigured again". */
+  previous?: "config" | "none";
+  /** True only when the pre-attempt state is fully back: the file (the old
+   *  block restored, or removed again for previous:"none") AND the live
+   *  connectors settled on it without a Slack error — the old connector
+   *  running again for "config", nothing left to run for "none". Never true
+   *  when the second reload reported a failure. */
   rolledBack?: boolean;
-  /** What the rollback achieved, separately: the file, and the live connector. */
+  /** What the rollback achieved, separately: the file, and the live
+   *  connector. running is always false for previous:"none" — there is no
+   *  previous connector to bring back. */
   restored?: { disk: boolean; running: boolean };
   rollbackError?: string;
   /** Set when the on-disk Slack block was changed by someone else between our
@@ -3490,6 +3499,7 @@ async function connectSlack(context: ApiContext, botToken: string, appToken: str
   // restore can never be older than what a concurrent writer put down.
   return withConfigLock(async () => {
     const previousSlack = readSlackBlock();
+    const previous = previousSlack ? ("config" as const) : ("none" as const);
     const outcome = await writeConfigPatchAndReload(context, { connectors: { slack: { botToken, appToken } } });
     const failure = slackFailure(outcome);
     if (!failure) return { ok: true, team: verified.bot.team, user: verified.bot.user };
@@ -3501,27 +3511,30 @@ async function connectSlack(context: ApiContext, botToken: string, appToken: str
     const onDisk = readSlackBlock();
     if (onDisk?.botToken !== botToken || onDisk?.appToken !== appToken) {
       logger.warn(`[onboarding] Slack connect failed (${failure}) but the Slack config changed concurrently — leaving it as is`);
-      return { ok: false, stage: "reload", error: failure, rolledBack: false,
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
         restored: { disk: false, running: false }, rollbackSkipped: "config changed concurrently" };
     }
-    logger.warn(`[onboarding] Slack connect failed after save (${failure}) — restoring previous Slack config`);
+    logger.warn(`[onboarding] Slack connect failed after save (${failure}) — ${previous === "config" ? "restoring previous Slack config" : "removing the Slack block again"}`);
     let rollback: ConfigPatchOutcome;
     try {
       rollback = await writeConfigPatchAndReload(context, { connectors: { slack: previousSlack ?? null } });
     } catch (err) {
       const rollbackError = err instanceof Error ? err.message : String(err);
       logger.error(`[onboarding] Slack rollback write failed: ${rollbackError}`);
-      return { ok: false, stage: "reload", error: failure, rolledBack: false,
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
         restored: { disk: false, running: false }, rollbackError };
     }
-    // The rollback is only a rollback if the previous connector actually came
-    // back up; a partial/errored second reload is reported as such.
-    const rollbackFailure = previousSlack ? slackFailure(rollback) : null;
+    // The rollback is only a rollback if the live side settled on the restored
+    // file: the previous connector came back up (previous:"config"), or the
+    // removal reload finished without a Slack error (previous:"none"). A
+    // partial/errored second reload is reported as such in both cases — the
+    // file is back, the connectors are not known to be.
+    const rollbackFailure = slackFailure(rollback);
     if (rollbackFailure) {
-      logger.error(`[onboarding] Slack rollback wrote the previous config but the connector did not start: ${rollbackFailure}`);
-      return { ok: false, stage: "reload", error: failure, rolledBack: false,
+      logger.error(`[onboarding] Slack rollback wrote the previous config but the connectors did not settle on it: ${rollbackFailure}`);
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
         restored: { disk: true, running: false }, rollbackError: rollbackFailure };
     }
-    return { ok: false, stage: "reload", error: failure, rolledBack: true, restored: { disk: true, running: Boolean(previousSlack) } };
+    return { ok: false, stage: "reload", error: failure, previous, rolledBack: true, restored: { disk: true, running: previous === "config" } };
   });
 }

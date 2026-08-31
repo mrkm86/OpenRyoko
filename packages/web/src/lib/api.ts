@@ -19,8 +19,13 @@ export interface SlackConnectResult {
   ok: boolean
   stage?: "verify" | "reload"
   error?: string
-  /** True only when the previous Slack block is back on disk AND running. */
+  /** What was there before the attempt: an existing Slack block, or none. */
+  previous?: "config" | "none"
+  /** True only when the pre-attempt state is fully back on disk AND the live
+   *  connectors settled on it (old connector running again for "config";
+   *  nothing left running for "none"). */
   rolledBack?: boolean
+  /** running is always false for previous:"none" — nothing to bring back. */
   restored?: { disk: boolean; running: boolean }
   rollbackError?: string
   rollbackSkipped?: string

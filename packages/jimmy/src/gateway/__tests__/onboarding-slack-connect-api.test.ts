@@ -100,7 +100,7 @@ describe("POST /api/onboarding/slack/connect", () => {
       .mockResolvedValueOnce({ started: [], stopped: ["slack"], errors: ["slack: An API error occurred: invalid_auth"] })
       .mockResolvedValueOnce({ started: ["slack"], stopped: [], errors: [] });
     const outcome = await connect(contextWith(reload));
-    expect(outcome).toMatchObject({ ok: false, stage: "reload", rolledBack: true, restored: { disk: true, running: true } });
+    expect(outcome).toMatchObject({ ok: false, stage: "reload", previous: "config", rolledBack: true, restored: { disk: true, running: true } });
     expect(String(outcome.error)).toContain("invalid_auth");
     expect(reload).toHaveBeenCalledTimes(2); // the failed start, then the rollback reload
     expect(readConfig().connectors?.slack).toEqual(PREVIOUS);
@@ -112,7 +112,7 @@ describe("POST /api/onboarding/slack/connect", () => {
       .mockResolvedValueOnce({ started: [], stopped: ["slack"], errors: ["slack: invalid_auth"] })
       .mockResolvedValueOnce({ started: [], stopped: [], errors: ["slack: connect ETIMEDOUT"] }); // rollback reload also fails
     const outcome = await connect(contextWith(reload));
-    expect(outcome).toMatchObject({ ok: false, stage: "reload", rolledBack: false, restored: { disk: true, running: false } });
+    expect(outcome).toMatchObject({ ok: false, stage: "reload", previous: "config", rolledBack: false, restored: { disk: true, running: false } });
     expect(String(outcome.rollbackError)).toContain("ETIMEDOUT");
     expect(readConfig().connectors?.slack).toEqual(PREVIOUS); // the file IS restored, and the result says so precisely
   });
@@ -205,7 +205,22 @@ describe("POST /api/onboarding/slack/connect", () => {
       .mockResolvedValueOnce({ started: [], stopped: [], errors: ["slack: invalid_auth"] })
       .mockResolvedValueOnce({ started: [], stopped: [], errors: [] });
     const outcome = await connect(contextWith(reload));
-    expect(outcome).toMatchObject({ ok: false, rolledBack: true });
+    // Undoing an attempt where nothing was configured before is its own
+    // state: the block is gone again and nothing is running — and the result
+    // says so instead of claiming a previous connection came back.
+    expect(outcome).toMatchObject({ ok: false, previous: "none", rolledBack: true, restored: { disk: true, running: false } });
     expect(readConfig().connectors?.slack).toBeUndefined();
+  });
+
+  it("does not call the removal a rollback when the reload after it fails too (no previous block)", async () => {
+    fs.writeFileSync(CONFIG_PATH, yaml.dump({ engines: { default: "claude" }, connectors: {} }));
+    stubSlack(true);
+    const reload = vi.fn()
+      .mockResolvedValueOnce({ started: [], stopped: [], errors: ["slack: invalid_auth"] })
+      .mockResolvedValueOnce({ started: [], stopped: [], errors: ["slack: stop timed out"] }); // the removal reload does not settle either
+    const outcome = await connect(contextWith(reload));
+    expect(outcome).toMatchObject({ ok: false, previous: "none", rolledBack: false, restored: { disk: true, running: false } });
+    expect(String(outcome.rollbackError)).toContain("stop timed out");
+    expect(readConfig().connectors?.slack).toBeUndefined(); // the file IS clean again; only the live side is reported as unsettled
   });
 });
