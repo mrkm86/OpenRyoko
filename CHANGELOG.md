@@ -2,6 +2,22 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.9.2] - 2026-08-31
+
+> macOS で `npm install -g openryoko` した直後に、最初のチャットで gateway が落ちる問題の修正。
+
+### 修正
+
+- **node-pty の `spawn-helper` に実行権限を付与する postinstall**（PR #62）: node-pty@1.1.0 の npm tarball は `prebuilds/darwin-*/spawn-helper` を 0644 で同梱しており、npm でも pnpm でも +x が付かない。macOS では最初の PTY 起動（チャットがエンジンを起動した瞬間）に `posix_spawnp` が失敗して gateway が落ちていた。公開パッケージ側の `postinstall`（`scripts/fix-prebuild-permissions.mjs`）が npm 配置（nested / hoisted / global）と pnpm workspace 配置の両方で `spawn-helper` を 0755 にする。失敗は全て非致命、Windows は即終了。開発用にルート `package.json` にも同種の postinstall（upstream jinn #104 の移植）
+- Linux（本番コンテナ）は darwin プレビルドを使わないため挙動に変化なし
+
+### Verification
+
+- 本物の `npm install`（node-pty@1.1.0 依存 + 同 postinstall）で 0644 → 0755、`--ignore-scripts` の対照は 0644 のまま。pnpm workspace で root / packages/jimmy 両方の postinstall が正常終了
+- Backend: **151 test files / 1,726 tests pass**（npm / hoisted / pnpm symlink / 未リンクの .pnpm ストア / 冪等 / node-pty 不在 の 6 ケースを新設）、tsc clean
+- Codex（gpt-5.6）2巡レビュー（不可 → 公開パッケージ側 postinstall を追加 → 可）
+- PR: [#62](https://github.com/rsensui2/OpenRyoko/pull/62)
+
 ## [2026.9.1] - 2026-08-31
 
 > 初回セットアップが「動くところまで」になった。名前を入れたら、エンジンの起動確認 → Slack をその場で検証して接続 → 最初の自動化を選ぶ、で Ryoko が仕事を始められる。
