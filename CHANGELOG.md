@@ -2,6 +2,29 @@
 
 > **バージョン体系について**: 2026.4.26 から日付ベース (`YYYY.M.D`) のCalVerに移行しました。npm semver の制約上、月・日の leading zero は付けません (例: 4月26日 → `2026.4.26`)。
 
+## [2026.8.31] - 2026-08-31
+
+> Workflow に「顔」がついた。cron と Workflow をひとつの「自動化」ページで扱い、テンプレートの穴埋めだけで作れる。AI エージェントは CLI から同じことができる。
+
+### このリリースでできるようになったこと
+
+- **「自動化」ページ**（旧「スケジュール」/cron）: cron と Workflow を1つのリストで表示・ON/OFF。行を開くと流れ図と実行履歴、「今すぐ実行」。集計・フィルタも両方を合算
+- **テンプレートから Workflow を作成**: 「見張り型」（定期チェック→必要な時だけ重いモデル）・「定時実行型」・「イベント駆動型」の3型。名前・間隔・プロンプト等の穴埋めだけで、ノードエディタ不要
+- **見張り型は既定で人間の承認ゲート付き**: 外部データ（メール等）の要約が何を言おうと、operator が承認するまで重いモデルは動かない。承認は Web の run 行のボタンか \`ryoko workflow approve\`。判定材料は「外部由来・未検証」ラベル付きで表示
+- **AI エージェント向け CLI**: \`ryoko automation list|enable|disable\`（cron/workflow を同じ動詞で）、\`ryoko workflow templates|list|create|show|run|runs|approve\`。全コマンド \`--json\`。同梱 docs（\`docs/automations.md\`）にエージェントの操作ガイド
+- **atomic な作成 API**: \`POST /api/automation/templates/:id\` / \`POST /api/automation/definitions\` — 完全検証を先に行い、作成〜有効化を1トランザクションで（失敗時に骨定義が残らない。通知と trigger 再アームは commit 後に1回）
+
+### 内部改善・整理
+
+- Workflow 一覧のカーソルページング対応（Web/CLI）、設定ページの「Cron」節を「自動化の通知」に役割限定
+- 滞留 PR の整理: #26（中断ターンを赤エラーにしない）と #57（crypto.randomUUID polyfill、#16 のリベース）を取り込み
+
+### Verification
+
+- Backend: **147 test files / 1,692 tests pass**（承認 routing・schedule→Merge 経路・atomic ロールバック・承認 API の HTTP 契約テストを含む）、tsc clean（jimmy/web）、web build 成功
+- Codex（gpt-5.6-sol）5巡レビュー（マージ不可×4 → 全指摘消化 → マージ可）
+- PR: [#59](https://github.com/rsensui2/OpenRyoko/pull/59)（本体）、[#57](https://github.com/rsensui2/OpenRyoko/pull/57)・[#26](https://github.com/rsensui2/OpenRyoko/pull/26)（取り込み）
+
 ## [2026.8.29] - 2026-08-28
 
 > 上流 Jinn の Workflow 基盤を移植した（オプトイン・既定OFF）。タスクの性質に応じて「決定的判定 / 軽量モデル / Opus級」を選べるルーティング基盤の第1弾（backend core）。
