@@ -1,3 +1,14 @@
+export interface EngineProbe {
+  name: string
+  configured: boolean
+  installed: boolean
+  runnable: boolean
+  bin?: string
+  version?: string
+  error?: string
+  auth?: { method: "api-key" | "oauth" | "unknown" | "none"; expiresAt?: string; expired?: boolean }
+}
+
 export interface WorkflowSummary {
   id: string
   title: string
@@ -340,6 +351,8 @@ export const api = {
     put<Record<string, unknown>>("/api/config", data),
   getLogs: (n?: number) =>
     get<{ lines: string[] }>(`/api/logs${n ? `?n=${n}` : ""}`),
+  getOnboardingEngines: () =>
+    get<{ default: string; engines: EngineProbe[] }>("/api/onboarding/engines"),
   getOnboarding: () =>
     get<{ needed: boolean; onboarded: boolean; sessionsCount: number; hasEmployees: boolean; portalName: string | null; operatorName: string | null }>("/api/onboarding"),
   completeOnboarding: (data: { portalName?: string; operatorName?: string; language?: string }) =>

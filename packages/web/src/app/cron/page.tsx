@@ -170,7 +170,23 @@ export default function CronPage() {
   const [updatedAgo, setUpdatedAgo] = useState("just now")
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
   const [wfCreating, setWfCreating] = useState(false)
+  const [wfInitialTemplate, setWfInitialTemplate] = useState<string | null>(null)
   const [wfCounts, setWfCounts] = useState({ total: 0, enabled: 0, disabled: 0, engineEnabled: true })
+
+  // Deep link from onboarding: /cron?create=<templateId> opens the creation
+  // panel on that template. The param is consumed once so a reload does not
+  // reopen the panel.
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const params = new URLSearchParams(window.location.search)
+    const create = params.get("create")
+    if (!create) return
+    setWfInitialTemplate(create)
+    setWfCreating(true)
+    params.delete("create")
+    const rest = params.toString()
+    window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}`)
+  }, [])
   const [triggeringId, setTriggeringId] = useState<string | null>(null)
   const [employeeMap, setEmployeeMap] = useState<Map<string, Employee>>(new Map())
 
@@ -343,7 +359,8 @@ export default function CronPage() {
                 {/* Workflows live in the same list view, above the cron groups */}
                 <WorkflowsSection
                   creating={wfCreating}
-                  onCloseCreate={() => setWfCreating(false)}
+                  initialTemplateId={wfInitialTemplate}
+                  onCloseCreate={() => { setWfCreating(false); setWfInitialTemplate(null) }}
                   filter={filter}
                   onCountsChange={setWfCounts}
                 />

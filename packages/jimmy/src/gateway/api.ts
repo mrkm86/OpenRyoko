@@ -2,6 +2,7 @@ import type { IncomingMessage as HttpRequest, ServerResponse } from "node:http";
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
 import cron from "node-cron";
@@ -495,6 +496,54 @@ export async function handleApiRequest(
           && workflowVerifyAuth(req.headers, context.authToken, context.authHome));
       if (await handleWorkflowApi(req, res, { method, pathname, url },
         { service: context.workflowService, authenticated })) return;
+    }
+
+    // GET /api/onboarding/engines — can each configured engine actually run?
+    // Installed (binary resolves), runnable (`--version` answers), and for
+    // Claude whether a subscription login / API key is present. This is the
+    // onboarding wizard's "does it work" check; /api/status only echoes config.
+    if (method === "GET" && pathname === "/api/onboarding/engines") {
+      const config = context.getConfig();
+      const { tryResolveBin } = await import("../shared/resolveBin.js");
+      const { execFile } = await import("node:child_process");
+      const probe = (name: string, bin: string | undefined): Promise<Record<string, unknown>> => new Promise((resolve) => {
+        if (!bin) { resolve({ name, configured: false, installed: false, runnable: false }); return; }
+        const resolved = tryResolveBin(bin);
+        if (!resolved) { resolve({ name, configured: true, installed: false, runnable: false, bin, error: `${bin} が PATH にありません` }); return; }
+        execFile(resolved, ["--version"], { timeout: 8_000, windowsHide: true }, (err, stdout, stderr) => {
+          if (err) {
+            resolve({ name, configured: true, installed: true, runnable: false, bin: resolved,
+              error: (stderr || err.message).toString().trim().split("\n")[0] });
+            return;
+          }
+          resolve({ name, configured: true, installed: true, runnable: true, bin: resolved,
+            version: stdout.toString().trim().split("\n")[0] });
+        });
+      });
+      const claudeAuth = (): Record<string, unknown> => {
+        if (process.env.ANTHROPIC_API_KEY) return { method: "api-key" };
+        try {
+          const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+          const raw = fs.readFileSync(path.join(dir, ".credentials.json"), "utf-8");
+          const expiresAt = JSON.parse(raw)?.claudeAiOauth?.expiresAt;
+          if (typeof expiresAt === "number" && expiresAt > 0) {
+            return { method: "oauth", expiresAt: new Date(expiresAt).toISOString(), expired: expiresAt < Date.now() };
+          }
+          return { method: "unknown" };
+        } catch {
+          return { method: "none" };
+        }
+      };
+      const [claude, codex, gemini] = await Promise.all([
+        probe("claude", config.engines.claude?.bin),
+        probe("codex", config.engines.codex?.bin),
+        probe("gemini", config.engines.gemini?.bin),
+      ]);
+      res.setHeader("Cache-Control", "no-store");
+      return json(res, {
+        default: config.engines.default,
+        engines: [{ ...claude, auth: claudeAuth() }, codex, ...(gemini.configured ? [gemini] : [])],
+      });
     }
 
     // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
