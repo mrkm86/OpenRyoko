@@ -498,55 +498,38 @@ export async function handleApiRequest(
         { service: context.workflowService, authenticated })) return;
     }
 
-    // GET /api/onboarding/engines — can each configured engine actually run?
-    // Installed (binary resolves), runnable (`--version` answers), and for
-    // Claude whether a subscription login / API key is present. This is the
-    // onboarding wizard's "does it work" check; /api/status only echoes config.
+    // GET /api/onboarding/engines — is each configured engine INSTALLED and
+    // STARTABLE, and what login state can be observed locally? This is an
+    // install check with the best available auth signal — the wizard words it
+    // that way. It never spends tokens or reaches the network. One probe runs
+    // at a time (shared in-flight promise) and the result is cached briefly,
+    // so a burst of requests spawns one set of child processes, not many.
     if (method === "GET" && pathname === "/api/onboarding/engines") {
       const config = context.getConfig();
-      const { tryResolveBin } = await import("../shared/resolveBin.js");
-      const { execFile } = await import("node:child_process");
-      const probe = (name: string, bin: string | undefined): Promise<Record<string, unknown>> => new Promise((resolve) => {
-        if (!bin) { resolve({ name, configured: false, installed: false, runnable: false }); return; }
-        const resolved = tryResolveBin(bin);
-        if (!resolved) { resolve({ name, configured: true, installed: false, runnable: false, bin, error: `${bin} が PATH にありません` }); return; }
-        execFile(resolved, ["--version"], { timeout: 8_000, windowsHide: true }, (err, stdout, stderr) => {
-          if (err) {
-            resolve({ name, configured: true, installed: true, runnable: false, bin: resolved,
-              error: (stderr || err.message).toString().trim().split("\n")[0] });
-            return;
-          }
-          resolve({ name, configured: true, installed: true, runnable: true, bin: resolved,
-            version: stdout.toString().trim().split("\n")[0] });
-        });
-      });
-      const claudeAuth = (): Record<string, unknown> => {
-        if (process.env.ANTHROPIC_API_KEY) return { method: "api-key" };
-        try {
-          const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
-          const raw = fs.readFileSync(path.join(dir, ".credentials.json"), "utf-8");
-          const expiresAt = JSON.parse(raw)?.claudeAiOauth?.expiresAt;
-          if (typeof expiresAt === "number" && expiresAt > 0) {
-            return { method: "oauth", expiresAt: new Date(expiresAt).toISOString(), expired: expiresAt < Date.now() };
-          }
-          return { method: "unknown" };
-        } catch {
-          return { method: "none" };
-        }
-      };
-      const [claude, codex, gemini] = await Promise.all([
-        probe("claude", config.engines.claude?.bin),
-        probe("codex", config.engines.codex?.bin),
-        probe("gemini", config.engines.gemini?.bin),
-      ]);
       res.setHeader("Cache-Control", "no-store");
-      return json(res, {
-        default: config.engines.default,
-        engines: [{ ...claude, auth: claudeAuth() }, codex, ...(gemini.configured ? [gemini] : [])],
-      });
+      return json(res, await probeOnboardingEngines(config));
     }
 
-    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
+    // POST /api/onboarding/slack/verify — prove BOTH Slack tokens before
+    // anything is saved: auth.test for the bot token, apps.connections.open
+    // for the app token (Socket Mode). Nothing is written here; the wizard
+    // saves only after both answer ok, so a wrong token can never overwrite a
+    // working connection.
+    if (method === "POST" && pathname === "/api/onboarding/slack/verify") {
+      const { readJsonBody } = await import("./http-helpers.js");
+      const read = await readJsonBody(req, res, { maxBytes: 16 * 1024 });
+      if (!read.ok) return;
+      const body = read.body as { botToken?: unknown; appToken?: unknown } | null;
+      const botToken = typeof body?.botToken === "string" ? body.botToken.trim() : "";
+      const appToken = typeof body?.appToken === "string" ? body.appToken.trim() : "";
+      if (!botToken.startsWith("xoxb-") || !appToken.startsWith("xapp-")) {
+        return badRequest(res, "botToken must start with xoxb- and appToken with xapp-");
+      }
+      res.setHeader("Cache-Control", "no-store");
+      return json(res, await verifySlackTokens(botToken, appToken));
+    }
+
+    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
     // Lives outside /api/workflows so a definition id can never shadow it.
     if (method === "GET" && pathname === "/api/automation/templates") {
       const { AUTOMATION_TEMPLATES } = await import("../workflows/templates.js");
@@ -3232,4 +3215,134 @@ async function runWebSession(
     });
     logger.error(`Web session ${currentSession.id} error: ${errMsg}`);
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// Onboarding probes (fork addition)
+// ---------------------------------------------------------------------------
+
+interface EngineProbeResult {
+  name: string;
+  configured: boolean;
+  installed: boolean;
+  runnable: boolean;
+  bin?: string;
+  version?: string;
+  error?: string;
+  auth?: { method: "api-key" | "oauth" | "chatgpt" | "none" | "unknown"; expiresAt?: string; expired?: boolean; note: string };
+}
+
+const ENGINE_PROBE_TTL_MS = 10_000;
+let engineProbeInFlight: Promise<{ default: string; probedAt: string; engines: EngineProbeResult[] }> | null = null;
+let engineProbeCache: { at: number; value: { default: string; probedAt: string; engines: EngineProbeResult[] } } | null = null;
+
+function runBinary(bin: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    import("node:child_process").then(({ execFile }) => {
+      execFile(bin, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ ok: !err, stdout: String(stdout ?? ""), stderr: String(stderr ?? err?.message ?? "") });
+      });
+    });
+  });
+}
+
+async function probeEngine(name: string, bin: string | undefined): Promise<EngineProbeResult> {
+  if (!bin) return { name, configured: false, installed: false, runnable: false };
+  const { tryResolveBin } = await import("../shared/resolveBin.js");
+  const resolved = tryResolveBin(bin);
+  if (!resolved) return { name, configured: true, installed: false, runnable: false, bin, error: `${bin} が PATH にありません` };
+  const version = await runBinary(resolved, ["--version"], 8_000);
+  if (!version.ok) {
+    return { name, configured: true, installed: true, runnable: false, bin: resolved,
+      error: version.stderr.trim().split("\n")[0] || "起動に失敗しました" };
+  }
+  return { name, configured: true, installed: true, runnable: true, bin: resolved, version: version.stdout.trim().split("\n")[0] };
+}
+
+/** What can be observed about Claude's login WITHOUT spending anything: an API
+ *  key in the environment, or the subscription OAuth file's expiry. Neither
+ *  proves the credential still works — the note says so. */
+function observeClaudeAuth(): NonNullable<EngineProbeResult["auth"]> {
+  if (process.env.ANTHROPIC_API_KEY) return { method: "api-key", note: "API キーが設定されています（有効性は初回実行時に判明）" };
+  try {
+    const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+    const raw = fs.readFileSync(path.join(dir, ".credentials.json"), "utf-8");
+    const expiresAt = JSON.parse(raw)?.claudeAiOauth?.expiresAt;
+    if (typeof expiresAt === "number" && expiresAt > 0) {
+      const expired = expiresAt < Date.now();
+      return { method: "oauth", expiresAt: new Date(expiresAt).toISOString(), expired,
+        note: expired ? "ログインの期限が切れています（claude を一度起動すると更新されます）" : "ログイン情報があります（有効性は初回実行時に判明）" };
+    }
+    return { method: "unknown", note: "ログイン情報の形式を判定できませんでした" };
+  } catch {
+    return { method: "none", note: "ログイン情報が見つかりません（端末で claude と入力してログイン）" };
+  }
+}
+
+/** `codex login status` answers with its exit code — the one engine that can
+ *  be asked directly, still without spending anything. */
+async function observeCodexAuth(resolvedBin: string): Promise<NonNullable<EngineProbeResult["auth"]>> {
+  const status = await runBinary(resolvedBin, ["login", "status"], 8_000);
+  if (status.ok) return { method: "chatgpt", note: (status.stdout.trim().split("\n")[0] || "ログイン済み") };
+  return { method: "none", note: "未ログインです（端末で codex login を実行）" };
+}
+
+async function probeOnboardingEngines(config: JinnConfig): Promise<{ default: string; probedAt: string; engines: EngineProbeResult[] }> {
+  if (engineProbeCache && Date.now() - engineProbeCache.at < ENGINE_PROBE_TTL_MS) return engineProbeCache.value;
+  if (engineProbeInFlight) return engineProbeInFlight;
+  engineProbeInFlight = (async () => {
+    const [claude, codex, gemini] = await Promise.all([
+      probeEngine("claude", config.engines.claude?.bin),
+      probeEngine("codex", config.engines.codex?.bin),
+      probeEngine("gemini", config.engines.gemini?.bin),
+    ]);
+    if (claude.runnable) claude.auth = observeClaudeAuth();
+    if (codex.runnable && codex.bin) codex.auth = await observeCodexAuth(codex.bin);
+    const value = {
+      default: config.engines.default, probedAt: new Date().toISOString(),
+      engines: [claude, codex, ...(gemini.configured ? [gemini] : [])],
+    };
+    engineProbeCache = { at: Date.now(), value };
+    return value;
+  })().finally(() => { engineProbeInFlight = null; });
+  return engineProbeInFlight;
+}
+
+/** Exposed for tests: forget the cached probe. */
+export function _resetEngineProbeCache(): void {
+  engineProbeCache = null;
+  engineProbeInFlight = null;
+}
+
+interface SlackVerifyResult {
+  ok: boolean;
+  bot: { ok: boolean; team?: string; user?: string; error?: string };
+  app: { ok: boolean; error?: string };
+}
+
+async function slackApi(method: string, token: string): Promise<{ ok: boolean; error?: string; [key: string]: unknown }> {
+  try {
+    const response = await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/x-www-form-urlencoded" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const payload = await response.json() as { ok?: boolean; error?: string; [key: string]: unknown };
+    return { ...payload, ok: payload.ok === true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function verifySlackTokens(botToken: string, appToken: string): Promise<SlackVerifyResult> {
+  const [bot, app] = await Promise.all([
+    slackApi("auth.test", botToken),
+    slackApi("apps.connections.open", appToken),
+  ]);
+  const botResult = bot.ok
+    ? { ok: true, team: typeof bot.team === "string" ? bot.team : undefined, user: typeof bot.user === "string" ? bot.user : undefined }
+    : { ok: false, error: bot.error ?? "auth.test failed" };
+  const appResult = app.ok ? { ok: true } : { ok: false, error: app.error ?? "apps.connections.open failed" };
+  return { ok: botResult.ok && appResult.ok, bot: botResult, app: appResult };
 }

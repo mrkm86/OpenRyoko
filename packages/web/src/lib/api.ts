@@ -6,7 +6,19 @@ export interface EngineProbe {
   bin?: string
   version?: string
   error?: string
-  auth?: { method: "api-key" | "oauth" | "unknown" | "none"; expiresAt?: string; expired?: boolean }
+  auth?: { method: "api-key" | "oauth" | "chatgpt" | "unknown" | "none"; expiresAt?: string; expired?: boolean; note: string }
+}
+
+export interface SlackVerifyResult {
+  ok: boolean
+  bot: { ok: boolean; team?: string; user?: string; error?: string }
+  app: { ok: boolean; error?: string }
+}
+
+/** PUT /api/config answers with the connector reload it triggered itself. */
+export interface ConfigUpdateResult extends Record<string, unknown> {
+  status?: "ok" | "partial" | string
+  connectorsReload?: { started?: string[]; stopped?: string[]; errors?: string[] }
 }
 
 export interface WorkflowSummary {
@@ -348,11 +360,13 @@ export const api = {
   reloadConnectors: () =>
     post<{ started: string[]; stopped: string[]; errors: string[] }>("/api/connectors/reload", {}),
   updateConfig: (data: Record<string, unknown>) =>
-    put<Record<string, unknown>>("/api/config", data),
+    put<ConfigUpdateResult>("/api/config", data),
   getLogs: (n?: number) =>
     get<{ lines: string[] }>(`/api/logs${n ? `?n=${n}` : ""}`),
   getOnboardingEngines: () =>
-    get<{ default: string; engines: EngineProbe[] }>("/api/onboarding/engines"),
+    get<{ default: string; probedAt: string; engines: EngineProbe[] }>("/api/onboarding/engines"),
+  verifySlackTokens: (botToken: string, appToken: string) =>
+    post<SlackVerifyResult>("/api/onboarding/slack/verify", { botToken, appToken }),
   getOnboarding: () =>
     get<{ needed: boolean; onboarded: boolean; sessionsCount: number; hasEmployees: boolean; portalName: string | null; operatorName: string | null }>("/api/onboarding"),
   completeOnboarding: (data: { portalName?: string; operatorName?: string; language?: string }) =>

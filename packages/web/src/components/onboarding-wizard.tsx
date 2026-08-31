@@ -53,20 +53,18 @@ function engineHint(probe: EngineProbe): string | null {
     return probe.name === "claude"
       ? "npm install -g @anthropic-ai/claude-code でインストールし、claude と入力してログインしてください"
       : probe.name === "codex"
-        ? "npm install -g @openai/codex でインストールし、codex と入力してログインしてください"
+        ? "npm install -g @openai/codex でインストールし、codex login でログインしてください"
         : `${probe.name} をインストールして PATH を通してください`
   }
   if (!probe.runnable) return `起動できませんでした: ${probe.error ?? "不明なエラー"}`
-  if (probe.name === "claude" && probe.auth) {
-    if (probe.auth.method === "none") return "ログイン情報が見つかりません。端末で claude と入力してログインしてください"
-    if (probe.auth.method === "oauth" && probe.auth.expired) return "ログインの有効期限が切れています。claude を一度起動すると更新されます"
-  }
   return null
 }
 
+/** ✓ means "installed and starts". Login is shown as observed information,
+ *  never as a green light — a credential's validity only shows on first use. */
 function engineState(probe: EngineProbe): "ok" | "warn" | "fail" {
   if (!probe.installed || !probe.runnable) return "fail"
-  if (probe.name === "claude" && probe.auth && (probe.auth.method === "none" || probe.auth.expired)) return "warn"
+  if (probe.auth && (probe.auth.method === "none" || probe.auth.expired)) return "warn"
   return "ok"
 }
 
@@ -75,9 +73,11 @@ function EngineCheckStep({ active }: { active: boolean }) {
   const [defaultEngine, setDefaultEngine] = useState<string>("")
   const [error, setError] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
+  const [attempted, setAttempted] = useState(false)
 
   const check = useCallback(() => {
     setChecking(true)
+    setAttempted(true)
     setError(null)
     api.getOnboardingEngines()
       .then((result) => { setProbes(result.engines); setDefaultEngine(result.default) })
@@ -85,7 +85,9 @@ function EngineCheckStep({ active }: { active: boolean }) {
       .finally(() => setChecking(false))
   }, [])
 
-  useEffect(() => { if (active && probes === null && !checking) check() }, [active, probes, checking, check])
+  // One automatic probe when the step opens; after that only the button asks
+  // again — a failing gateway must not be hammered in a retry loop.
+  useEffect(() => { if (active && !attempted) check() }, [active, attempted, check])
 
   return (
     <div className="animate-fade-in">
@@ -93,7 +95,7 @@ function EngineCheckStep({ active }: { active: boolean }) {
         エンジンの確認
       </h2>
       <p className="text-[length:var(--text-subheadline)] text-[var(--text-tertiary)] mb-[var(--space-4)]">
-        AI エンジンが実際に動くか確認します。ここが ✗ だと Ryoko は働けません。
+        AI エンジンがインストールされ、起動できるかを確認します（✓ = 起動できる）。ログインの有効性は最初の実行で判明します。ここが ✗ だと Ryoko は働けません。
       </p>
       {error && (
         <div className="text-[length:var(--text-footnote)] text-[var(--system-red)] mb-[var(--space-3)]">確認できませんでした: {error}</div>
@@ -121,10 +123,12 @@ function EngineCheckStep({ active }: { active: boolean }) {
                 </div>
                 <div className="text-[length:var(--text-caption1)] text-[var(--text-tertiary)]">
                   {probe.version ?? (probe.installed ? "バージョン不明" : "未インストール")}
-                  {probe.name === "claude" && probe.auth && state === "ok" && (
-                    <span className="ml-2">・{probe.auth.method === "api-key" ? "API キー" : "ログイン済み"}</span>
-                  )}
                 </div>
+                {probe.auth && (
+                  <div className="text-[length:var(--text-caption1)] mt-0.5" style={{ color: state === "warn" ? color : "var(--text-secondary)" }}>
+                    ログイン: {probe.auth.note}
+                  </div>
+                )}
                 {hint && (
                   <div className="text-[length:var(--text-caption1)] mt-1 whitespace-pre-wrap" style={{ color }}>{hint}</div>
                 )}
@@ -162,13 +166,14 @@ function SlackStep() {
   const [appToken, setAppToken] = useState("")
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null)
-  const [already, setAlready] = useState<string | null>(null)
+  const [already, setAlready] = useState(false)
+  const [replaceExisting, setReplaceExisting] = useState(false)
 
   useEffect(() => {
     api.getStatus()
       .then((status) => {
         const slack = connectorHealth(status).slack
-        if (slack && slack.status === "running") setAlready("Slack は既に接続されています")
+        if (slack && slack.status === "running") setAlready(true)
       })
       .catch(() => { /* status is optional here */ })
   }, [])
@@ -181,23 +186,36 @@ function SlackStep() {
     setBusy(true)
     setResult(null)
     try {
-      await api.updateConfig({ connectors: { slack: { botToken, appToken } } })
-      await api.reloadConnectors()
-      // Give Socket Mode a moment, then read the connector's own health.
-      await new Promise((resolve) => setTimeout(resolve, 2500))
-      const status = await api.getStatus()
-      const slack = connectorHealth(status).slack
-      if (slack?.status === "running") {
-        setResult({ ok: true, message: "接続できました。Slack で Ryoko にメンションしてみてください" })
-      } else {
-        setResult({ ok: false, message: `接続できていません（${slack?.status ?? "未起動"}${slack?.detail ? `: ${slack.detail}` : ""}）。トークンとアプリの Socket Mode 設定を確認してください` })
+      // 1. Prove both tokens BEFORE anything is saved — a wrong token must
+      //    never overwrite a working connection.
+      const verified = await api.verifySlackTokens(botToken, appToken)
+      if (!verified.ok) {
+        const parts = []
+        if (!verified.bot.ok) parts.push(`Bot Token: ${verified.bot.error ?? "auth.test に失敗"}`)
+        if (!verified.app.ok) parts.push(`App Token: ${verified.app.error ?? "Socket Mode 接続に失敗"}（アプリの Socket Mode が有効で、connections:write スコープがあるか確認）`)
+        setResult({ ok: false, message: `保存していません。${parts.join(" / ")}` })
+        return
       }
+      // 2. Save. PUT /api/config reloads the connectors itself and reports
+      //    the outcome — read that instead of reloading again and guessing.
+      const saved = await api.updateConfig({ connectors: { slack: { botToken, appToken } } })
+      const errors = saved.connectorsReload?.errors ?? []
+      const slackError = errors.find((line) => /slack/i.test(line))
+      if (saved.status === "partial" && slackError) {
+        setResult({ ok: false, message: `トークンは正しいのに接続の起動に失敗しました: ${slackError}` })
+        return
+      }
+      setResult({
+        ok: true,
+        message: `接続できました（ワークスペース: ${verified.bot.team ?? "?"} / Bot: ${verified.bot.user ?? "?"}）。Slack で Ryoko にメンションしてみてください`,
+      })
     } catch (err) {
       setResult({ ok: false, message: err instanceof Error ? err.message : String(err) })
     } finally {
       setBusy(false)
     }
   }
+  const canConnect = Boolean(botToken && appToken) && (!already || replaceExisting)
 
   const inputClass = "apple-input w-full bg-[var(--bg-secondary)] border border-[var(--separator)] rounded-[var(--radius-sm)] px-3 py-2 text-[length:var(--text-body)] text-[var(--text-primary)]"
 
@@ -210,7 +228,13 @@ function SlackStep() {
         Ryoko が働く場所です。Slack アプリ（Socket Mode）の2つのトークンを入れると、その場で接続を試します。あとで設定ページからでも構いません。
       </p>
       {already && (
-        <div className="text-[length:var(--text-footnote)] text-[var(--system-green)] mb-[var(--space-3)]">{already}</div>
+        <div className="mb-[var(--space-3)]">
+          <div className="text-[length:var(--text-footnote)] text-[var(--system-green)]">Slack は既に接続されています。「次へ」で構いません。</div>
+          <label className="flex items-center gap-2 mt-1 text-[length:var(--text-caption1)] text-[var(--text-secondary)] cursor-pointer">
+            <input type="checkbox" checked={replaceExisting} onChange={(e) => setReplaceExisting(e.target.checked)} />
+            既存の接続を新しいトークンで差し替える
+          </label>
+        </div>
       )}
       <div className="flex flex-col gap-[var(--space-3)]">
         <div>
@@ -228,15 +252,15 @@ function SlackStep() {
         <div>
           <button
             onClick={connect}
-            disabled={busy || !botToken || !appToken}
+            disabled={busy || !canConnect}
             className="inline-flex items-center gap-1.5 px-4 py-2 rounded-[var(--radius-md)] border-none cursor-pointer text-[length:var(--text-subheadline)] font-[var(--weight-semibold)]"
             style={{
-              background: busy || !botToken || !appToken ? "var(--fill-tertiary)" : "var(--accent)",
-              color: busy || !botToken || !appToken ? "var(--text-tertiary)" : "var(--accent-contrast)",
+              background: busy || !canConnect ? "var(--fill-tertiary)" : "var(--accent)",
+              color: busy || !canConnect ? "var(--text-tertiary)" : "var(--accent-contrast)",
             }}
           >
             {busy ? <Loader2 size={16} className="animate-spin" /> : null}
-            {busy ? "接続中…" : "接続する"}
+            {busy ? "確認して接続中…" : "確認して接続する"}
           </button>
         </div>
         {result && (
@@ -246,7 +270,7 @@ function SlackStep() {
         )}
       </div>
       <p className="text-[length:var(--text-caption1)] text-[var(--text-tertiary)] mt-[var(--space-3)]">
-        トークンは config.yaml に保存され、画面には再表示されません。
+        両方のトークンを Slack に照会してから保存します（正しくないトークンは保存されません）。保存後は画面に再表示されません。
       </p>
     </div>
   )
