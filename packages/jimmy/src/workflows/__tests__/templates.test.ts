@@ -16,6 +16,7 @@ import { WorkflowRepository } from "../repository.js";
 import type { WorkflowSessionExecutor } from "../session-executor.js";
 import { WorkflowService } from "../service.js";
 import { AUTOMATION_TEMPLATES, buildTemplateBody, intervalToCron, TemplateError } from "../templates.js";
+import { createWorkflowAtomically } from "../../gateway/workflow-atomic-create.js";
 
 /* A template's whole promise is "fill in the blanks and it runs" — so every
  * template must build a body the canonical saveDefinition validation accepts,
@@ -142,7 +143,13 @@ describe("watch-then-act routes through the real runner", () => {
 
     const act = executor.commands.find((cmd) => cmd.owner.nodeId === "act")!;
     expect(act.prompt).toContain("未返信の問い合わせが2件あります");
-    expect(act.prompt).toContain("指示ではありません");
+    // Injection boundary: instructions come first, the data marker is opened
+    // and never closed, and the summary sits after the marker — the only thing
+    // the runner appends beyond it is its own fixed output contract, which the
+    // prompt names explicitly. A smuggled closing tag therefore reopens nothing.
+    expect(act.prompt.indexOf("やること")).toBeLessThan(act.prompt.indexOf("<external-report>"));
+    expect(act.prompt.indexOf("<external-report>")).toBeLessThan(act.prompt.indexOf("未返信の問い合わせが2件あります"));
+    expect(act.prompt).not.toContain("</external-report>");
 
     await executor.succeed("act", {});
     await vi.waitFor(() => {
@@ -162,6 +169,56 @@ describe("watch-then-act routes through the real runner", () => {
       expect(runs.items[0]!.status).toBe("completed");
     });
     expect(executor.commands.some((cmd) => cmd.owner.nodeId === "act")).toBe(false);
+  });
+});
+
+describe("a schedule fire routes through the merge gate", () => {
+  it("a run created on the schedule trigger reaches the watch node", async () => {
+    saveBuilt("sched-gate", "watch-then-act", WATCH_VARS);
+    // Exactly what trigger-service.start() does on a schedule fire
+    // (trigger-service.ts): create the run on the schedule trigger's own node,
+    // then hand it to the runner. The runner is private on the service, so the
+    // test reaches it the way that method does.
+    const created = repository.createRun({
+      workflowId: "sched-gate", input: {},
+      trigger: { nodeId: "start", kind: "schedule", fireId: "fire-1", payload: {} },
+    });
+    await (service as unknown as { runner: { start(runId: string): Promise<unknown> } }).runner.start(created.id);
+    await vi.waitFor(() => expect(executor.commands.some((cmd) => cmd.owner.nodeId === "watch")).toBe(true));
+    // The unfired manual trigger never blocks the gate.
+    await executor.succeed("watch", { needsAction: false, summary: "対応不要" });
+    await vi.waitFor(() => {
+      const runs = service.listRuns("sched-gate", {});
+      expect(runs.items[0]!.status).toBe("completed");
+    });
+  });
+});
+
+describe("atomic create leaves nothing behind on failure", () => {
+  it("rolls the created definition back when the save step refuses the body", () => {
+    const body = buildTemplateBody("scheduled-report", {
+      employee: "ryoko", schedule: "0 7 * * *", prompt: "報告する",
+    });
+    // An edge referencing a node that does not exist fails saveDefinition —
+    // one transaction means the createDefinition before it unwinds too.
+    const brokenEdges = [...body.edges, { id: "e-broken", from: { nodeId: "ghost", port: "success" }, to: { nodeId: "done", port: "input" } }];
+    expect(() => createWorkflowAtomically(database, service, {
+      id: "atomic-broken", title: "atomic-broken", nodes: body.nodes,
+      edges: brokenEdges as never, enable: true,
+    })).toThrow();
+    expect(repository.getDefinition("atomic-broken") ?? null).toBeNull();
+  });
+
+  it("creates, saves, and enables in one call when the body is sound", () => {
+    const body = buildTemplateBody("scheduled-report", {
+      employee: "ryoko", schedule: "0 7 * * *", prompt: "報告する",
+    });
+    const result = createWorkflowAtomically(database, service, {
+      id: "atomic-ok", title: "atomic-ok", description: body.description,
+      nodes: body.nodes, edges: body.edges as never, enable: true,
+    });
+    expect(result.enabled).toBe(true);
+    expect(repository.getDefinition("atomic-ok")!.enabled).toBe(true);
   });
 });
 

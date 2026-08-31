@@ -44,15 +44,19 @@ async function rawGateway(method: string, apiPath: string, data?: unknown): Prom
 }
 
 /** Whether the workflow engine is on — from the capability endpoint, which
- *  answers 200 either way. A 404 under /api/workflows can then be reported as
+ *  answers 200 either way. A failing capability call is an ERROR, never a
+ *  silent "engine off": conflating the two would make an API outage look like
+ *  a configuration choice. A 404 under /api/workflows can then be reported as
  *  what it is: this specific workflow does not exist. */
 async function workflowsEnabled(): Promise<boolean> {
   const result = await rawGateway("GET", "/api/automation/templates");
-  if (!result.ok) return false;
+  if (!result.ok) {
+    fail(`ゲートウェイの状態を確認できません（GET /api/automation/templates が HTTP ${result.status}）。\`ryoko status\` とゲートウェイのログを確認してください。`);
+  }
   try {
     return Boolean((JSON.parse(result.body) as { workflowsEnabled?: boolean }).workflowsEnabled);
   } catch {
-    return false;
+    fail("ゲートウェイの応答を JSON として読めませんでした（/api/automation/templates）");
   }
 }
 
@@ -178,7 +182,9 @@ export async function runAutomationToggle(
     });
     return;
   }
-  fail(`"${id}" は cron にも workflow にもありません（一覧: ryoko automation list）`);
+  fail(engineOn
+    ? `"${id}" は cron にも workflow にもありません（一覧: ryoko automation list）`
+    : `"${id}" は cron にありません。${ENGINE_DISABLED_MESSAGE}`);
 }
 
 export async function runWorkflowTemplates(opts: { json?: boolean }): Promise<void> {
@@ -269,25 +275,15 @@ export async function runWorkflowCreate(opts: WorkflowCreateOptions): Promise<vo
     fail(`定義が実行可能ではありません:\n${JSON.stringify(executable.issues, null, 2)}`);
   }
 
-  const created = await gateway("POST", "/api/workflows", {
-    id, title: opts.title ?? id, ...(definition.description ? { description: definition.description } : {}),
-  }) as { id: string; revision: number };
-  const saved = await gateway("PUT", `/api/workflows/${encodeURIComponent(id)}`, {
-    definition: { ...created, nodes: definition.nodes, edges: definition.edges },
-    expectedRevision: created.revision,
+  // One request, one transaction on the server: no skeleton on failure.
+  const result = await gateway("POST", "/api/automation/definitions", {
+    name: id, ...(opts.title ? { title: opts.title } : {}),
+    ...(definition.description ? { description: definition.description } : {}),
+    nodes: definition.nodes, edges: definition.edges, enable: Boolean(opts.enable),
   }) as { id: string; revision: number; enabled: boolean };
 
-  let enabled = saved.enabled;
-  let revision = saved.revision;
-  if (opts.enable) {
-    const armed = await gateway("POST", `/api/workflows/${encodeURIComponent(id)}/enable`,
-      { expectedRevision: saved.revision }) as { enabled: boolean; revision: number };
-    enabled = armed.enabled;
-    revision = armed.revision;
-  }
-
-  emit(Boolean(opts.json), { id, revision, enabled }, () => {
-    console.log(`workflow ${id} を作成しました（${enabled ? "有効" : "無効のまま。有効化: ryoko automation enable " + id}）`);
+  emit(Boolean(opts.json), result, () => {
+    console.log(`workflow ${result.id} を作成しました（${result.enabled ? "有効" : "無効のまま。有効化: ryoko automation enable " + result.id}）`);
   });
 }
 
@@ -340,10 +336,17 @@ export async function runWorkflowList(opts: { json?: boolean }): Promise<void> {
 }
 
 /** Report and exit. In --json mode the error itself is machine-readable
- *  (stderr, single JSON object) so agents never have to parse prose. */
+ *  (stderr, single JSON object) so agents never have to parse prose — for
+ *  unexpected errors too, with the stack preserved alongside. */
 export function reportCliFailure(error: unknown, json = false): never {
   if (error instanceof CliFailure) {
     console.error(json ? JSON.stringify({ error: error.message }) : error.message);
+    process.exit(1);
+  }
+  if (json) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+    console.error(JSON.stringify({ error: message, unexpected: true, ...(stack ? { stack } : {}) }));
     process.exit(1);
   }
   throw error;

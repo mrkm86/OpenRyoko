@@ -137,6 +137,9 @@ export interface ApiContext {
   authHome?: string;
   /** Present only when config.workflows.enabled — carries the Workflow engine. */
   workflowService?: WorkflowService;
+  /** The workflow store's own connection — atomic create wraps the service
+   *  calls in one transaction on it. Present alongside workflowService. */
+  workflowDatabase?: import("better-sqlite3").Database;
 }
 
 export function resumePendingWebQueueItems(context: ApiContext): void {
@@ -498,49 +501,77 @@ export async function handleApiRequest(
       return json(res, { templates: AUTOMATION_TEMPLATES, workflowsEnabled: Boolean(context.workflowService) });
     }
 
-    // POST /api/automation/templates/:id — build from a template and save (and
-    // optionally enable) in one request. The FULL definition is validated —
-    // schema and executability — BEFORE anything touches the repository, so a
-    // bad request can never leave a skeleton definition behind (short of a DB
-    // failure between the create and the save).
+    // POST /api/automation/templates/:id  — build from a template
+    // POST /api/automation/definitions    — raw nodes/edges (agents, --file)
+    // Both validate the FULL definition (schema + executability) up front and
+    // then create+save+enable in ONE transaction (atomic-create.ts), so no
+    // failure can leave a skeleton definition behind.
     {
       const templateParams = matchRoute("/api/automation/templates/:id", pathname);
-      if (method === "POST" && templateParams) {
-        if (!context.workflowService) {
+      const isRawCreate = pathname === "/api/automation/definitions";
+      if (method === "POST" && (templateParams || isRawCreate)) {
+        if (!context.workflowService || !context.workflowDatabase) {
           return json(res, { error: "Workflow エンジンが無効です。config.workflows.enabled: true にして再起動してください。" }, 404);
         }
+        const { isJsonMediaType } = await import("./media-type.js");
+        if (!isJsonMediaType(req.headers["content-type"])) {
+          return json(res, { error: "Content-Type must be application/json" }, 415);
+        }
         const { readJsonBody } = await import("./http-helpers.js");
-        const read = await readJsonBody(req, res);
-        if (!read.ok) return; // readJsonBody already responded (bad JSON / body too large)
+        const read = await readJsonBody(req, res, { maxBytes: 256 * 1024, rejectDuplicateTopLevelKeys: true });
+        if (!read.ok) return; // readJsonBody already responded (bad JSON / dup keys / too large)
         const parsed = read.body;
         if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
           return badRequest(res, "Request body must be a JSON object");
         }
-        const known = new Set(["name", "title", "vars", "enable"]);
+        const known = new Set(isRawCreate
+          ? ["name", "title", "description", "nodes", "edges", "enable"]
+          : ["name", "title", "vars", "enable"]);
         const unknown = Object.keys(parsed).filter((key) => !known.has(key));
         if (unknown.length > 0) return badRequest(res, `Unknown field(s): ${unknown.join(", ")}`);
-        const { name, title, vars, enable } = parsed as { name?: unknown; title?: unknown; vars?: unknown; enable?: unknown };
+        const { name, title, vars, enable, description, nodes, edges } = parsed as {
+          name?: unknown; title?: unknown; vars?: unknown; enable?: unknown;
+          description?: unknown; nodes?: unknown; edges?: unknown;
+        };
         if (typeof name !== "string" || !name.trim()) {
           return badRequest(res, "name is required (workflow id, alphanumeric + hyphen)");
         }
         if (title !== undefined && typeof title !== "string") return badRequest(res, "title must be a string");
         if (enable !== undefined && typeof enable !== "boolean") return badRequest(res, "enable must be a boolean");
-        if (vars !== undefined && (typeof vars !== "object" || vars === null || Array.isArray(vars)
-          || Object.values(vars).some((value) => typeof value !== "string"))) {
-          return badRequest(res, "vars must be an object of string values");
-        }
-        const { buildTemplateBody, TemplateError } = await import("../workflows/templates.js");
+
+        const { TemplateError } = await import("../workflows/templates.js");
         const { workflowDefinitionSchema } = await import("../workflows/model.js");
         const { validateExecutableWorkflow } = await import("../workflows/validation.js");
         const { WorkflowRepositoryError } = await import("../workflows/repository-support.js");
+        const { createWorkflowAtomically } = await import("./workflow-atomic-create.js");
         try {
-          const built = buildTemplateBody(templateParams.id, (vars ?? {}) as Record<string, string>);
+          let builtDescription: string | undefined;
+          let builtNodes: unknown;
+          let builtEdges: unknown;
+          if (templateParams) {
+            if (vars !== undefined && (typeof vars !== "object" || vars === null || Array.isArray(vars)
+              || Object.values(vars).some((value) => typeof value !== "string"))) {
+              return badRequest(res, "vars must be an object of string values");
+            }
+            const { buildTemplateBody } = await import("../workflows/templates.js");
+            const built = buildTemplateBody(templateParams.id, (vars ?? {}) as Record<string, string>);
+            builtDescription = built.description;
+            builtNodes = built.nodes;
+            builtEdges = built.edges;
+          } else {
+            if (description !== undefined && typeof description !== "string") return badRequest(res, "description must be a string");
+            if (!Array.isArray(nodes) || !Array.isArray(edges)) return badRequest(res, "nodes and edges are required arrays");
+            builtDescription = description as string | undefined;
+            builtNodes = nodes;
+            builtEdges = edges;
+          }
           // Pre-validate the complete definition the save would produce.
           const now = new Date().toISOString();
           const candidate = workflowDefinitionSchema.safeParse({
-            schemaVersion: 1, id: name, title: title ?? name, description: built.description,
+            schemaVersion: 1, id: name, title: title ?? name,
+            ...(builtDescription ? { description: builtDescription } : {}),
             revision: 1, enabled: false, createdAt: now, updatedAt: now,
-            nodes: built.nodes, edges: built.edges,
+            nodes: builtNodes, edges: builtEdges,
           });
           if (!candidate.success) {
             return json(res, { error: "Workflow definition is invalid.", issues: candidate.error.issues }, 422);
@@ -549,17 +580,13 @@ export async function handleApiRequest(
           if (!executable.ok) {
             return json(res, { error: "Workflow definition is not executable.", issues: executable.issues }, 422);
           }
-          const created = context.workflowService.createDefinition({
-            id: name, title: (title as string | undefined) ?? name, description: built.description,
+          const result = createWorkflowAtomically(context.workflowDatabase, context.workflowService, {
+            id: name, title: (title as string | undefined) ?? name,
+            ...(builtDescription ? { description: builtDescription } : {}),
+            nodes: candidate.data.nodes, edges: candidate.data.edges,
+            enable: enable === true,
           });
-          const saved = context.workflowService.saveDefinition(
-            { ...created, nodes: built.nodes, edges: built.edges } as never,
-            created.revision,
-          );
-          const armed = enable === true
-            ? context.workflowService.setEnabled({ id: saved.id, enabled: true, expectedRevision: saved.revision })
-            : saved;
-          return json(res, { id: armed.id, revision: armed.revision, enabled: armed.enabled }, 201);
+          return json(res, result, 201);
         } catch (error) {
           if (error instanceof TemplateError) return json(res, { error: error.message }, 422);
           if (error instanceof WorkflowRepositoryError) {
@@ -567,8 +594,8 @@ export async function handleApiRequest(
               : error.code === "not-found" ? 404 : 422;
             return json(res, { error: error.message, code: error.code }, status);
           }
-          console.error(`[automation] template create failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
-          return serverError(res, "Template create failed");
+          console.error(`[automation] create failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+          return serverError(res, "Workflow create failed");
         }
       }
     }

@@ -335,9 +335,9 @@ export default function CronPage() {
               <TabsContent value="overview">
                 {/* Summary cards */}
                 <div className="grid grid-cols-3 gap-[var(--space-3)] mb-[var(--space-4)] mt-[var(--space-4)]">
-                  <SummaryCard label="ジョブ総数" value={jobs.length} />
-                  <SummaryCard label="有効" value={enabledCount} color="var(--system-green)" />
-                  <SummaryCard label="無効" value={disabledCount} color="var(--text-tertiary)" />
+                  <SummaryCard label="自動化の総数" value={jobs.length + wfCounts.total} />
+                  <SummaryCard label="有効" value={enabledCount + wfCounts.enabled} color="var(--system-green)" />
+                  <SummaryCard label="無効" value={disabledCount + wfCounts.disabled} color="var(--text-tertiary)" />
                 </div>
 
                 {/* Workflows live in the same list view, above the cron groups */}
