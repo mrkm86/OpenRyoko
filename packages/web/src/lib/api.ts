@@ -279,7 +279,9 @@ export const api = {
   resetSession: (id: string) =>
     post<{ status: string; sessionId: string }>(`/api/sessions/${id}/reset`, {}),
   // --- Workflows (automation hub) ---
-  getWorkflows: () => get<WorkflowSummary[]>("/api/workflows"),
+  getWorkflows: (cursor?: string) =>
+    get<{ items: WorkflowSummary[]; nextCursor: string | null }>(
+      cursor ? `/api/workflows?cursor=${encodeURIComponent(cursor)}` : "/api/workflows"),
   getWorkflow: (id: string) => get<WorkflowDefinitionDetail>(`/api/workflows/${encodeURIComponent(id)}`),
   setWorkflowEnabled: (id: string, enabled: boolean, expectedRevision: number) =>
     post<WorkflowSummary>(`/api/workflows/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, { expectedRevision }),

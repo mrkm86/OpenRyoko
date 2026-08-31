@@ -249,33 +249,68 @@ function CreatePanel({ onCreated, onClose }: { onCreated: () => void; onClose: (
 /*  Section                                                            */
 /* ------------------------------------------------------------------ */
 
-export function WorkflowsSection({ creating, onCloseCreate, onCountChange }: {
+export interface WorkflowCounts {
+  total: number
+  enabled: number
+  disabled: number
+  engineEnabled: boolean
+}
+
+async function fetchAllWorkflows(): Promise<WorkflowSummary[]> {
+  const items: WorkflowSummary[] = []
+  let cursor: string | undefined
+  do {
+    const page = await api.getWorkflows(cursor)
+    items.push(...page.items)
+    cursor = page.nextCursor ?? undefined
+  } while (cursor)
+  return items
+}
+
+export function WorkflowsSection({ creating, onCloseCreate, filter, onCountsChange }: {
   creating: boolean
   onCloseCreate: () => void
-  onCountChange?: (count: number) => void
+  filter: "all" | "enabled" | "disabled"
+  onCountsChange?: (counts: WorkflowCounts) => void
 }) {
   const [workflows, setWorkflows] = useState<WorkflowSummary[] | null>(null)
   const [engineEnabled, setEngineEnabled] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [details, setDetails] = useState<Map<string, WorkflowDefinitionDetail>>(new Map())
   const [runsRefresh, setRunsRefresh] = useState(0)
   const [notice, setNotice] = useState<string | null>(null)
 
   const refresh = useCallback(() => {
-    api.getWorkflows()
-      .then((items) => {
-        const live = items.filter((item) => !item.retiredAt)
-        setWorkflows(live)
+    // The capability endpoint answers 200 whether or not the engine is on, so
+    // "engine disabled" and "the list request failed" stay distinguishable.
+    api.getAutomationTemplates()
+      .then(async ({ workflowsEnabled }) => {
+        if (!workflowsEnabled) {
+          setEngineEnabled(false)
+          setWorkflows([])
+          setLoadError(null)
+          onCountsChange?.({ total: 0, enabled: 0, disabled: 0, engineEnabled: false })
+          return
+        }
         setEngineEnabled(true)
-        onCountChange?.(live.length)
+        try {
+          const items = await fetchAllWorkflows()
+          const live = items.filter((item) => !item.retiredAt)
+          setWorkflows(live)
+          setLoadError(null)
+          onCountsChange?.({
+            total: live.length,
+            enabled: live.filter((item) => item.enabled).length,
+            disabled: live.filter((item) => !item.enabled).length,
+            engineEnabled: true,
+          })
+        } catch (err) {
+          setLoadError(err instanceof Error ? err.message : String(err))
+        }
       })
-      .catch(() => {
-        // 404 = engine disabled; the section degrades to guidance.
-        setWorkflows([])
-        setEngineEnabled(false)
-        onCountChange?.(0)
-      })
-  }, [onCountChange])
+      .catch((err) => setLoadError(err instanceof Error ? err.message : String(err)))
+  }, [onCountsChange])
 
   useEffect(() => { refresh() }, [refresh])
 
@@ -299,6 +334,20 @@ export function WorkflowsSection({ creating, onCloseCreate, onCountChange }: {
       .catch((err) => setNotice(err instanceof Error ? err.message : String(err)))
   }
 
+  if (loadError) {
+    return (
+      <div className="bg-[rgba(255,69,58,0.06)] border border-[var(--system-red)] rounded-[var(--radius-md)] p-[var(--space-4)] text-[var(--system-red)] text-[length:var(--text-footnote)] mb-[var(--space-4)]">
+        ワークフロー一覧を取得できませんでした: {loadError}
+        <button
+          onClick={refresh}
+          className="ml-[var(--space-3)] underline bg-none border-none text-inherit cursor-pointer text-[length:inherit]"
+        >
+          再試行
+        </button>
+      </div>
+    )
+  }
+
   if (!engineEnabled) {
     return (
       <div className="rounded-[var(--radius-md)] border border-[var(--separator)] bg-[var(--material-regular)] p-[var(--space-4)] mb-[var(--space-4)] text-[length:var(--text-footnote)] text-[var(--text-secondary)]">
@@ -318,18 +367,21 @@ export function WorkflowsSection({ creating, onCloseCreate, onCountChange }: {
       )}
       {workflows === null ? (
         <Skeleton className="h-12 rounded-[var(--radius-sm)] mb-[var(--space-3)]" />
-      ) : workflows.length === 0 ? null : (
+      ) : (() => {
+        const visible = workflows.filter((item) =>
+          filter === "all" ? true : filter === "enabled" ? item.enabled : !item.enabled)
+        return visible.length === 0 ? null : (
         <div>
           <div className="flex items-center gap-[var(--space-2)] mb-[var(--space-2)]">
             <span className="text-[length:var(--text-caption1)] font-[var(--weight-semibold)] text-[var(--text-secondary)]">
               ワークフロー
             </span>
             <span className="text-[length:var(--text-caption2)] text-[var(--text-quaternary)]">
-              {workflows.length} 件 ・ 判定を挟んで必要な時だけ AI が動きます
+              {visible.length} 件 ・ 判定を挟んで必要な時だけ AI が動きます
             </span>
           </div>
           <div className="rounded-[var(--radius-md)] overflow-hidden bg-[var(--material-regular)] border border-[var(--separator)]">
-            {workflows.map((workflow, index) => {
+            {visible.map((workflow, index) => {
               const isExpanded = expandedId === workflow.id
               const detail = details.get(workflow.id)
               return (
@@ -386,14 +438,16 @@ export function WorkflowsSection({ creating, onCloseCreate, onCountChange }: {
                     <div className="px-[var(--space-4)] pb-[var(--space-3)] pt-1 flex flex-col gap-[var(--space-3)] bg-[var(--fill-quaternary)]">
                       {detail && <NodeFlow detail={detail} />}
                       <WorkflowRuns workflowId={workflow.id} refreshKey={runsRefresh} />
-                      <div>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); runNow(workflow) }}
-                          className="px-3 py-1.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-caption1)] font-semibold bg-[var(--fill-secondary)] text-[var(--text-primary)]"
-                        >
-                          ▶ 今すぐ実行
-                        </button>
-                      </div>
+                      {workflow.enabled && detail?.nodes.some((node) => node.type === "trigger" && (node.config as { kind?: string }).kind === "manual") && (
+                        <div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); runNow(workflow) }}
+                            className="px-3 py-1.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-caption1)] font-semibold bg-[var(--fill-secondary)] text-[var(--text-primary)]"
+                          >
+                            ▶ 今すぐ実行
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -401,7 +455,7 @@ export function WorkflowsSection({ creating, onCloseCreate, onCountChange }: {
             })}
           </div>
         </div>
-      )}
+      )})()}
     </div>
   )
 }

@@ -75,23 +75,25 @@ program
     .option("--json", "JSON形式で出力（AIエージェント向け）")
     .action(async (opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runAutomationList(opts).catch(cli.reportCliFailure);
+      await cli.runAutomationList(opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   automationCmd
     .command("enable <id>")
     .description("自動化を有効にする（cron / workflow どちらでも）")
+    .option("--kind <kind>", "cron / workflow（同名IDが両方にある時に指定）")
     .option("--json", "JSON形式で出力")
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean; kind?: string }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runAutomationToggle(id, true, opts).catch(cli.reportCliFailure);
+      await cli.runAutomationToggle(id, true, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   automationCmd
     .command("disable <id>")
     .description("自動化を無効にする（cron / workflow どちらでも）")
+    .option("--kind <kind>", "cron / workflow（同名IDが両方にある時に指定）")
     .option("--json", "JSON形式で出力")
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean; kind?: string }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runAutomationToggle(id, false, opts).catch(cli.reportCliFailure);
+      await cli.runAutomationToggle(id, false, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
 
   const workflowCmd = program
@@ -103,7 +105,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowTemplates(opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowTemplates(opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
     .command("list")
@@ -111,7 +113,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowList(opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowList(opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
     .command("create")
@@ -125,7 +127,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (opts: { template?: string; file?: string; name: string; title?: string; set: string[]; enable?: boolean; json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowCreate(opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowCreate(opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
     .command("show <id>")
@@ -133,7 +135,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (id: string, opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowShow(id, opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowShow(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
     .command("run <id>")
@@ -141,7 +143,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (id: string, opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowStart(id, opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowStart(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
     .command("runs <id>")
@@ -149,7 +151,7 @@ program
     .option("--json", "JSON形式で出力")
     .action(async (id: string, opts: { json?: boolean }) => {
       const cli = await import("../src/cli/automation.js");
-      await cli.runWorkflowRuns(id, opts).catch(cli.reportCliFailure);
+      await cli.runWorkflowRuns(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
 }
 

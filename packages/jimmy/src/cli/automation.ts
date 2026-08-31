@@ -24,27 +24,52 @@ interface WorkflowSummaryRow {
   retiredAt: string | null;
 }
 
+interface CursorPage<T> {
+  items: T[];
+  nextCursor: string | null;
+}
+
 class CliFailure extends Error {}
 
 function fail(message: string): never {
   throw new CliFailure(message);
 }
 
-async function gateway(method: string, apiPath: string, data?: unknown): Promise<unknown> {
-  let result;
+async function rawGateway(method: string, apiPath: string, data?: unknown): Promise<{ ok: boolean; status: number; body: string }> {
   try {
-    result = await requestGatewayApi({ method, path: apiPath, ...(data === undefined ? {} : { data: JSON.stringify(data) }) });
+    return await requestGatewayApi({ method, path: apiPath, ...(data === undefined ? {} : { data: JSON.stringify(data) }) });
   } catch (error) {
     fail(`ゲートウェイに接続できません（${error instanceof Error ? error.message : String(error)}）。\`ryoko status\` で稼働を確認してください。`);
   }
+}
+
+/** Whether the workflow engine is on — from the capability endpoint, which
+ *  answers 200 either way. A 404 under /api/workflows can then be reported as
+ *  what it is: this specific workflow does not exist. */
+async function workflowsEnabled(): Promise<boolean> {
+  const result = await rawGateway("GET", "/api/automation/templates");
+  if (!result.ok) return false;
+  try {
+    return Boolean((JSON.parse(result.body) as { workflowsEnabled?: boolean }).workflowsEnabled);
+  } catch {
+    return false;
+  }
+}
+
+const ENGINE_DISABLED_MESSAGE =
+  "Workflow エンジンが無効です。config.yaml に `workflows:\n  enabled: true` を追記してゲートウェイを再起動してください。";
+
+async function gateway(method: string, apiPath: string, data?: unknown): Promise<unknown> {
+  const result = await rawGateway(method, apiPath, data);
   if (result.status === 404 && apiPath.startsWith("/api/workflows")) {
-    fail("Workflow エンジンが無効です。config.yaml に `workflows:\\n  enabled: true` を追記してゲートウェイを再起動してください。");
+    if (!(await workflowsEnabled())) fail(ENGINE_DISABLED_MESSAGE);
+    fail(`見つかりません: ${method} ${apiPath}（ID を確認してください。一覧: ryoko workflow list）`);
   }
   if (!result.ok) {
     let detail = result.body;
     try {
-      const parsed = JSON.parse(result.body) as { message?: string; issues?: unknown };
-      detail = parsed.message ?? result.body;
+      const parsed = JSON.parse(result.body) as { message?: string; error?: string; issues?: unknown };
+      detail = parsed.message ?? parsed.error ?? result.body;
       if (parsed.issues) detail += `\n${JSON.stringify(parsed.issues, null, 2)}`;
     } catch { /* leave raw */ }
     fail(`${method} ${apiPath} が失敗しました（HTTP ${result.status}）: ${detail}`);
@@ -54,6 +79,19 @@ async function gateway(method: string, apiPath: string, data?: unknown): Promise
   } catch {
     fail(`${apiPath} の応答を JSON として読めませんでした`);
   }
+}
+
+/** Drain every page of a cursor-paged list endpoint. */
+async function gatewayAllPages<T>(apiPath: string): Promise<T[]> {
+  const items: T[] = [];
+  let cursor: string | null = null;
+  do {
+    const url = cursor ? `${apiPath}?cursor=${encodeURIComponent(cursor)}` : apiPath;
+    const page = await gateway("GET", url) as CursorPage<T>;
+    items.push(...page.items);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return items;
 }
 
 function emit(json: boolean, data: unknown, human: () => void): void {
@@ -71,21 +109,14 @@ function cronLastRunAt(job: CronJobRow): string {
 
 /** One merged table: workflows and cron jobs, the same rows the web page shows. */
 export async function runAutomationList(opts: { json?: boolean }): Promise<void> {
-  const [cronJobs, workflowResult] = await Promise.all([
+  const [cronJobs, engineOn] = await Promise.all([
     gateway("GET", "/api/cron") as Promise<CronJobRow[]>,
-    (async () => {
-      try {
-        return await gateway("GET", "/api/workflows") as WorkflowSummaryRow[];
-      } catch (error) {
-        // Workflows disabled is a normal state for the merged list — show cron alone.
-        if (error instanceof CliFailure && error.message.includes("Workflow エンジンが無効")) return null;
-        throw error;
-      }
-    })(),
+    workflowsEnabled(),
   ]);
+  const workflowRows = engineOn ? await gatewayAllPages<WorkflowSummaryRow>("/api/workflows") : [];
 
   const rows = [
-    ...(workflowResult ?? []).filter((item) => !item.retiredAt).map((item) => ({
+    ...workflowRows.filter((item) => !item.retiredAt).map((item) => ({
       kind: "workflow" as const, id: item.id, title: item.title, enabled: item.enabled, schedule: null as string | null, lastRun: null as string | null,
     })),
     ...cronJobs.map((job) => ({
@@ -94,8 +125,8 @@ export async function runAutomationList(opts: { json?: boolean }): Promise<void>
     })),
   ];
 
-  emit(Boolean(opts.json), { workflowsEnabled: workflowResult !== null, automations: rows }, () => {
-    if (workflowResult === null) {
+  emit(Boolean(opts.json), { workflowsEnabled: engineOn, automations: rows }, () => {
+    if (!engineOn) {
       console.log("(Workflow エンジンは無効。cron のみ表示 — 有効化は config.workflows.enabled: true)\n");
     }
     const pad = (value: string, width: number) => value.length > width ? value.slice(0, width - 1) + "…" : value.padEnd(width);
@@ -107,24 +138,47 @@ export async function runAutomationList(opts: { json?: boolean }): Promise<void>
   });
 }
 
-/** enable/disable works on either kind by the same verb — the caller should
- *  not have to know which storage a row lives in. */
-export async function runAutomationToggle(id: string, enabled: boolean, opts: { json?: boolean }): Promise<void> {
+/** enable/disable works on either kind by the same verb. When one id exists on
+ *  BOTH sides, the caller has to say which one they mean (--kind). */
+export async function runAutomationToggle(
+  id: string,
+  enabled: boolean,
+  opts: { json?: boolean; kind?: string },
+): Promise<void> {
+  if (opts.kind !== undefined && opts.kind !== "cron" && opts.kind !== "workflow") {
+    fail(`--kind は cron か workflow です（指定値: ${opts.kind}）`);
+  }
   const cronJobs = await gateway("GET", "/api/cron") as CronJobRow[];
   const cron = cronJobs.find((job) => job.id === id);
-  if (cron) {
+  const engineOn = await workflowsEnabled();
+  const workflowRows = engineOn ? await gatewayAllPages<WorkflowSummaryRow>("/api/workflows") : [];
+  const workflow = workflowRows.find((item) => item.id === id);
+
+  let kind = opts.kind as "cron" | "workflow" | undefined;
+  if (!kind) {
+    if (cron && workflow) fail(`"${id}" は cron と workflow の両方にあります。--kind cron か --kind workflow で指定してください。`);
+    kind = cron ? "cron" : workflow ? "workflow" : undefined;
+  }
+  if (kind === "cron") {
+    if (!cron) fail(`cron "${id}" は見つかりません（一覧: ryoko automation list）`);
     await gateway("PUT", `/api/cron/${encodeURIComponent(id)}`, { enabled });
     emit(Boolean(opts.json), { kind: "cron", id, enabled }, () => {
       console.log(`cron ${id} を ${enabled ? "有効" : "無効"} にしました`);
     });
     return;
   }
-  const definition = await gateway("GET", `/api/workflows/${encodeURIComponent(id)}`) as { revision: number };
-  const saved = await gateway("POST", `/api/workflows/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`,
-    { expectedRevision: definition.revision }) as { enabled: boolean; revision: number };
-  emit(Boolean(opts.json), { kind: "workflow", id, enabled: saved.enabled }, () => {
-    console.log(`workflow ${id} を ${saved.enabled ? "有効" : "無効"} にしました`);
-  });
+  if (kind === "workflow") {
+    if (!workflow) {
+      fail(engineOn ? `workflow "${id}" は見つかりません（一覧: ryoko workflow list）` : ENGINE_DISABLED_MESSAGE);
+    }
+    const saved = await gateway("POST", `/api/workflows/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`,
+      { expectedRevision: workflow.revision }) as { enabled: boolean; revision: number };
+    emit(Boolean(opts.json), { kind: "workflow", id, enabled: saved.enabled, revision: saved.revision }, () => {
+      console.log(`workflow ${id} を ${saved.enabled ? "有効" : "無効"} にしました`);
+    });
+    return;
+  }
+  fail(`"${id}" は cron にも workflow にもありません（一覧: ryoko automation list）`);
 }
 
 export async function runWorkflowTemplates(opts: { json?: boolean }): Promise<void> {
@@ -160,8 +214,10 @@ export async function runWorkflowCreate(opts: WorkflowCreateOptions): Promise<vo
   if (!opts.name) fail("--name <id> は必須です（英数とハイフン。例: --name inquiry-watch）");
   const id = opts.name;
 
-  let body: { description?: string; nodes: unknown[]; edges: unknown[] };
   if (opts.template) {
+    // The atomic endpoint validates the FULL definition before anything is
+    // written, and enables in the same request — no skeleton on failure, and
+    // the returned revision is the one the caller can act on.
     const vars: Record<string, string> = {};
     for (const pair of opts.set) {
       const eq = pair.indexOf("=");
@@ -169,42 +225,68 @@ export async function runWorkflowCreate(opts: WorkflowCreateOptions): Promise<vo
       vars[pair.slice(0, eq)] = pair.slice(eq + 1);
     }
     try {
-      body = buildTemplateBody(opts.template, vars);
+      buildTemplateBody(opts.template, vars); // fail fast locally with fixable messages
     } catch (error) {
       if (error instanceof TemplateError) fail(error.message);
       throw error;
     }
-  } else {
-    const { readFileSync } = await import("node:fs");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(opts.file!, "utf-8"));
-    } catch (error) {
-      fail(`${opts.file} を読めませんでした: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const definition = parsed as { nodes?: unknown[]; edges?: unknown[]; description?: string };
-    if (!Array.isArray(definition.nodes) || !Array.isArray(definition.edges)) {
-      fail(`${opts.file} に nodes / edges がありません。GET /api/workflows/<id> が返す definition と同じ形にしてください`);
-    }
-    body = { description: definition.description, nodes: definition.nodes, edges: definition.edges };
+    const result = await gateway("POST", `/api/automation/templates/${encodeURIComponent(opts.template)}`, {
+      name: id, ...(opts.title ? { title: opts.title } : {}), vars, enable: Boolean(opts.enable),
+    }) as { id: string; revision: number; enabled: boolean };
+    emit(Boolean(opts.json), result, () => {
+      console.log(`workflow ${result.id} を作成しました（${result.enabled ? "有効" : "無効のまま。有効化: ryoko automation enable " + result.id}）`);
+    });
+    return;
+  }
+
+  const { readFileSync } = await import("node:fs");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(opts.file!, "utf-8"));
+  } catch (error) {
+    fail(`${opts.file} を読めませんでした: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const definition = parsed as { nodes?: unknown[]; edges?: unknown[]; description?: string };
+  if (!Array.isArray(definition.nodes) || !Array.isArray(definition.edges)) {
+    fail(`${opts.file} に nodes / edges がありません。GET /api/workflows/<id> が返す definition と同じ形にしてください`);
+  }
+  // Validate the complete definition locally BEFORE creating, so a bad file
+  // never leaves a skeleton definition behind on the server.
+  const { workflowDefinitionSchema } = await import("../workflows/model.js");
+  const { validateExecutableWorkflow } = await import("../workflows/validation.js");
+  const now = new Date().toISOString();
+  const candidate = workflowDefinitionSchema.safeParse({
+    schemaVersion: 1, id, title: opts.title ?? id,
+    ...(definition.description ? { description: definition.description } : {}),
+    revision: 1, enabled: false, createdAt: now, updatedAt: now,
+    nodes: definition.nodes, edges: definition.edges,
+  });
+  if (!candidate.success) {
+    fail(`定義がスキーマに合いません:\n${JSON.stringify(candidate.error.issues, null, 2)}`);
+  }
+  const executable = validateExecutableWorkflow(candidate.data);
+  if (!executable.ok) {
+    fail(`定義が実行可能ではありません:\n${JSON.stringify(executable.issues, null, 2)}`);
   }
 
   const created = await gateway("POST", "/api/workflows", {
-    id, title: opts.title ?? id, ...(body.description ? { description: body.description } : {}),
+    id, title: opts.title ?? id, ...(definition.description ? { description: definition.description } : {}),
   }) as { id: string; revision: number };
   const saved = await gateway("PUT", `/api/workflows/${encodeURIComponent(id)}`, {
-    definition: { ...created, nodes: body.nodes, edges: body.edges },
+    definition: { ...created, nodes: definition.nodes, edges: definition.edges },
     expectedRevision: created.revision,
   }) as { id: string; revision: number; enabled: boolean };
 
   let enabled = saved.enabled;
+  let revision = saved.revision;
   if (opts.enable) {
     const armed = await gateway("POST", `/api/workflows/${encodeURIComponent(id)}/enable`,
-      { expectedRevision: saved.revision }) as { enabled: boolean };
+      { expectedRevision: saved.revision }) as { enabled: boolean; revision: number };
     enabled = armed.enabled;
+    revision = armed.revision;
   }
 
-  emit(Boolean(opts.json), { id, revision: saved.revision, enabled }, () => {
+  emit(Boolean(opts.json), { id, revision, enabled }, () => {
     console.log(`workflow ${id} を作成しました（${enabled ? "有効" : "無効のまま。有効化: ryoko automation enable " + id}）`);
   });
 }
@@ -248,7 +330,7 @@ export async function runWorkflowRuns(id: string, opts: { json?: boolean }): Pro
 }
 
 export async function runWorkflowList(opts: { json?: boolean }): Promise<void> {
-  const items = await gateway("GET", "/api/workflows") as WorkflowSummaryRow[];
+  const items = await gatewayAllPages<WorkflowSummaryRow>("/api/workflows");
   emit(Boolean(opts.json), { workflows: items }, () => {
     for (const item of items) {
       console.log(`${item.enabled ? "ON " : "off"}  ${item.id} — ${item.title}${item.retiredAt ? "（退役）" : ""}`);
@@ -257,9 +339,11 @@ export async function runWorkflowList(opts: { json?: boolean }): Promise<void> {
   });
 }
 
-export function reportCliFailure(error: unknown): never {
+/** Report and exit. In --json mode the error itself is machine-readable
+ *  (stderr, single JSON object) so agents never have to parse prose. */
+export function reportCliFailure(error: unknown, json = false): never {
   if (error instanceof CliFailure) {
-    console.error(error.message);
+    console.error(json ? JSON.stringify({ error: error.message }) : error.message);
     process.exit(1);
   }
   throw error;

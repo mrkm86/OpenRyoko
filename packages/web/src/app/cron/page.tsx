@@ -170,7 +170,7 @@ export default function CronPage() {
   const [updatedAgo, setUpdatedAgo] = useState("just now")
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
   const [wfCreating, setWfCreating] = useState(false)
-  const [wfCount, setWfCount] = useState(0)
+  const [wfCounts, setWfCounts] = useState({ total: 0, enabled: 0, disabled: 0, engineEnabled: true })
   const [triggeringId, setTriggeringId] = useState<string | null>(null)
   const [employeeMap, setEmployeeMap] = useState<Map<string, Employee>>(new Map())
 
@@ -260,7 +260,7 @@ export default function CronPage() {
               </h1>
               {!loading && (
                 <p className="text-[length:var(--text-footnote)] text-[var(--text-secondary)] mt-[var(--space-1)]">
-                  cron {jobs.length} 件{wfCount > 0 ? <> &middot; ワークフロー {wfCount} 件</> : null} &middot; 有効 {enabledCount} &middot; 無効 {disabledCount}
+                  cron {jobs.length} 件{wfCounts.total > 0 ? <> &middot; ワークフロー {wfCounts.total} 件</> : null} &middot; 有効 {enabledCount + wfCounts.enabled} &middot; 無効 {disabledCount + wfCounts.disabled}
                 </p>
               )}
             </div>
@@ -268,8 +268,14 @@ export default function CronPage() {
               <div className="flex items-center gap-[var(--space-3)]">
                 <button
                   onClick={() => setWfCreating(true)}
-                  className="px-3.5 py-1.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-footnote)] font-semibold"
-                  style={{ background: "var(--accent)", color: "var(--accent-contrast)" }}
+                  disabled={!wfCounts.engineEnabled}
+                  title={wfCounts.engineEnabled ? undefined : "Workflow エンジンが無効です（config.workflows.enabled: true で有効化）"}
+                  className="px-3.5 py-1.5 rounded-[var(--radius-sm)] border-none text-[length:var(--text-footnote)] font-semibold"
+                  style={{
+                    background: wfCounts.engineEnabled ? "var(--accent)" : "var(--fill-tertiary)",
+                    color: wfCounts.engineEnabled ? "var(--accent-contrast)" : "var(--text-tertiary)",
+                    cursor: wfCounts.engineEnabled ? "pointer" : "not-allowed",
+                  }}
                 >
                   ＋ 新規作成
                 </button>
@@ -338,14 +344,15 @@ export default function CronPage() {
                 <WorkflowsSection
                   creating={wfCreating}
                   onCloseCreate={() => setWfCreating(false)}
-                  onCountChange={setWfCount}
+                  filter={filter}
+                  onCountsChange={setWfCounts}
                 />
 
                 {/* Filter pills */}
                 <div className="flex items-center gap-[var(--space-2)] mb-[var(--space-3)]">
                   {(["all", "enabled", "disabled"] as Filter[]).map(f => {
                     const isActive = filter === f
-                    const count = f === "all" ? jobs.length : f === "enabled" ? enabledCount : disabledCount
+                    const count = f === "all" ? jobs.length + wfCounts.total : f === "enabled" ? enabledCount + wfCounts.enabled : disabledCount + wfCounts.disabled
                     return (
                       <button
                         key={f}
