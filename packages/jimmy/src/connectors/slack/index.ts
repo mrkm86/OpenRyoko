@@ -21,7 +21,9 @@ import {
 import {
   evaluateRespondPolicy,
   hasMentionScope,
+  resolveRespondMode,
   respondPolicyNeedsTracking,
+  shouldHandleReaction,
 } from "./respond-policy.js";
 import { isOperatorSpeaker } from "../../shared/operator-match.js";
 import { explicitThread } from "../../shared/threading.js";
@@ -645,6 +647,15 @@ export class SlackConnector implements Connector {
 
       // Skip bot's own reactions
       if (this.botUserId && event.user === this.botUserId) return;
+
+      // A mention-gated channel scope cannot be satisfied by a reaction, which
+      // carries no @-mention; see shouldHandleReaction.
+      if (!shouldHandleReaction(this.respondTo, event.item.channel)) {
+        logger.debug(
+          `[slack] respondTo.channel=${resolveRespondMode(this.respondTo, "channel")} — ignoring channel reaction on ${event.item.channel}:${event.item.ts}`,
+        );
+        return;
+      }
 
       if (!this.handler) return;
 
