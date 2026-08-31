@@ -15,6 +15,17 @@ export interface SlackVerifyResult {
   app: { ok: boolean; error?: string }
 }
 
+export interface SlackConnectResult {
+  ok: boolean
+  stage?: "verify" | "reload"
+  error?: string
+  rolledBack?: boolean
+  team?: string
+  user?: string
+  bot?: SlackVerifyResult["bot"]
+  app?: SlackVerifyResult["app"]
+}
+
 /** PUT /api/config answers with the connector reload it triggered itself. */
 export interface ConfigUpdateResult extends Record<string, unknown> {
   status?: "ok" | "partial" | string
@@ -367,6 +378,9 @@ export const api = {
     get<{ default: string; probedAt: string; engines: EngineProbe[] }>("/api/onboarding/engines"),
   verifySlackTokens: (botToken: string, appToken: string) =>
     post<SlackVerifyResult>("/api/onboarding/slack/verify", { botToken, appToken }),
+  // Verify → save → reload → rollback-on-failure as ONE server-side operation.
+  connectSlack: (botToken: string, appToken: string) =>
+    post<SlackConnectResult>("/api/onboarding/slack/connect", { botToken, appToken }),
   getOnboarding: () =>
     get<{ needed: boolean; onboarded: boolean; sessionsCount: number; hasEmployees: boolean; portalName: string | null; operatorName: string | null }>("/api/onboarding"),
   completeOnboarding: (data: { portalName?: string; operatorName?: string; language?: string }) =>

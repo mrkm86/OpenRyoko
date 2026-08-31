@@ -161,6 +161,18 @@ function connectorHealth(status: unknown): ConnectorHealthMap {
   return connectors && typeof connectors === "object" ? (connectors as ConnectorHealthMap) : {}
 }
 
+/** Slack's error codes and our normalized ones, in words a person can act on. */
+function describeSlackError(code: string | undefined): string {
+  switch (code) {
+    case "invalid_auth": return "トークンが無効です"
+    case "not_authed": return "トークンが送られていません"
+    case "account_inactive": return "このトークンのアカウントは無効化されています"
+    case "network_error": return "Slack に接続できませんでした（ネットワークを確認）"
+    case undefined: return "確認に失敗しました"
+    default: return code.startsWith("http_") ? `Slack が HTTP ${code.slice(5)} を返しました` : code
+  }
+}
+
 function SlackStep() {
   const [botToken, setBotToken] = useState("")
   const [appToken, setAppToken] = useState("")
@@ -186,31 +198,30 @@ function SlackStep() {
     setBusy(true)
     setResult(null)
     try {
-      // 1. Prove both tokens BEFORE anything is saved — a wrong token must
-      //    never overwrite a working connection.
-      const verified = await api.verifySlackTokens(botToken, appToken)
-      if (!verified.ok) {
-        const parts = []
-        if (!verified.bot.ok) parts.push(`Bot Token: ${verified.bot.error ?? "auth.test に失敗"}`)
-        if (!verified.app.ok) parts.push(`App Token: ${verified.app.error ?? "Socket Mode 接続に失敗"}（アプリの Socket Mode が有効で、connections:write スコープがあるか確認）`)
-        setResult({ ok: false, message: `保存していません。${parts.join(" / ")}` })
+      // One server-side operation: verify both tokens → save → reload → if
+      // the connector still fails, the server restores the previous Slack
+      // config itself. Whatever comes back, nothing here has to guess.
+      const outcome = await api.connectSlack(botToken, appToken)
+      if (outcome.ok) {
+        setResult({
+          ok: true,
+          message: `接続できました（ワークスペース: ${outcome.team ?? "?"} / Bot: ${outcome.user ?? "?"}）。Slack で Ryoko にメンションしてみてください`,
+        })
         return
       }
-      // 2. Save. PUT /api/config reloads the connectors itself and reports
-      //    the outcome — read that instead of reloading again and guessing.
-      const saved = await api.updateConfig({ connectors: { slack: { botToken, appToken } } })
-      const errors = saved.connectorsReload?.errors ?? []
-      const slackError = errors.find((line) => /slack/i.test(line))
-      if (saved.status === "partial" && slackError) {
-        setResult({ ok: false, message: `トークンは正しいのに接続の起動に失敗しました: ${slackError}` })
+      if (outcome.stage === "verify") {
+        const parts = []
+        if (outcome.bot && !outcome.bot.ok) parts.push(`Bot Token: ${describeSlackError(outcome.bot.error)}`)
+        if (outcome.app && !outcome.app.ok) parts.push(`App Token: ${describeSlackError(outcome.app.error)}（アプリの Socket Mode が有効で、connections:write スコープがあるか確認）`)
+        setResult({ ok: false, message: `保存していません。${parts.join(" / ") || "トークンを確認できませんでした"}` })
         return
       }
       setResult({
-        ok: true,
-        message: `接続できました（ワークスペース: ${verified.bot.team ?? "?"} / Bot: ${verified.bot.user ?? "?"}）。Slack で Ryoko にメンションしてみてください`,
+        ok: false,
+        message: `トークンは正しいのに接続の起動に失敗しました: ${outcome.error ?? "不明なエラー"}${outcome.rolledBack ? "（以前の Slack 設定に戻しました）" : ""}`,
       })
     } catch (err) {
-      setResult({ ok: false, message: err instanceof Error ? err.message : String(err) })
+      setResult({ ok: false, message: `接続処理でエラーが起きました: ${err instanceof Error ? err.message : String(err)}` })
     } finally {
       setBusy(false)
     }

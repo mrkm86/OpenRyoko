@@ -127,6 +127,14 @@ describe("GET /api/onboarding/engines", () => {
     expect(JSON.stringify(payload)).not.toContain("SECRET");
   });
 
+  it("does not answer a changed engine config from the previous config's cache", async () => {
+    const before = await probe(contextFor({ claude: { bin: process.execPath, model: "opus" }, codex: { bin: "nope-xyz", model: "gpt" } }));
+    // Same process, no reset — only the config differs (codex now points at a real binary).
+    const after = await probe(contextFor({ claude: { bin: process.execPath, model: "opus" }, codex: { bin: process.execPath, model: "gpt" } }));
+    expect(after.probedAt).not.toBe(before.probedAt);
+    expect(after.engines.find((engine) => engine.name === "codex")!.runnable).toBe(true);
+  });
+
   it("shares one probe across concurrent requests and serves it from cache briefly", async () => {
     const context = contextFor({ claude: { bin: process.execPath, model: "opus" }, codex: { bin: "nope-xyz", model: "gpt" } });
     const [first, second] = await Promise.all([probe(context), probe(context)]);

@@ -39,7 +39,7 @@ function stubSlack(answers: Record<string, { ok: boolean; [key: string]: unknown
     const method = String(url).split("/api/")[1]!;
     const token = init?.headers?.Authorization ?? "";
     const answer = answers[`${method}:${token}`] ?? { ok: false, error: "invalid_auth" };
-    return { json: async () => answer } as Response;
+    return { ok: true, status: 200, json: async () => answer } as Response;
   }));
 }
 
@@ -77,13 +77,20 @@ describe("POST /api/onboarding/slack/verify", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("turns a network failure into a per-token error, not a 500", async () => {
+  it("turns a network failure into a normalized per-token code, never a 500 or a raw message", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("getaddrinfo ENOTFOUND slack.com"); }));
     const { res, read } = fakeResponse();
     await handleApiRequest(fakePost("/api/onboarding/slack/verify", { botToken: "xoxb-x", appToken: "xapp-x" }), res, context);
     const { status, body } = read();
     expect(status).toBe(200);
-    expect(body).toMatchObject({ ok: false, bot: { ok: false }, app: { ok: false } });
-    expect(String((body as { bot: { error: string } }).bot.error)).toContain("ENOTFOUND");
+    expect(body).toMatchObject({ ok: false, bot: { ok: false, error: "network_error" }, app: { ok: false, error: "network_error" } });
+    expect(JSON.stringify(body)).not.toContain("ENOTFOUND");
+  });
+
+  it("treats a non-2xx HTTP answer as a failure even if the body were to say ok", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ ok: true }) }) as Response));
+    const { res, read } = fakeResponse();
+    await handleApiRequest(fakePost("/api/onboarding/slack/verify", { botToken: "xoxb-x", appToken: "xapp-x" }), res, context);
+    expect(read().body).toMatchObject({ ok: false, bot: { ok: false, error: "http_500" }, app: { ok: false, error: "http_500" } });
   });
 });
