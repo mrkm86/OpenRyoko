@@ -53,11 +53,16 @@ async function workflowsEnabled(): Promise<boolean> {
   if (!result.ok) {
     fail(`ゲートウェイの状態を確認できません（GET /api/automation/templates が HTTP ${result.status}）。\`ryoko status\` とゲートウェイのログを確認してください。`);
   }
+  let flag: unknown;
   try {
-    return Boolean((JSON.parse(result.body) as { workflowsEnabled?: boolean }).workflowsEnabled);
+    flag = (JSON.parse(result.body) as { workflowsEnabled?: unknown }).workflowsEnabled;
   } catch {
     fail("ゲートウェイの応答を JSON として読めませんでした（/api/automation/templates）");
   }
+  if (typeof flag !== "boolean") {
+    fail("ゲートウェイの応答に workflowsEnabled (boolean) がありません（/api/automation/templates）");
+  }
+  return flag;
 }
 
 const ENGINE_DISABLED_MESSAGE =
@@ -322,6 +327,34 @@ export async function runWorkflowRuns(id: string, opts: { json?: boolean }): Pro
       const node = run.currentOrFailingNode ? ` @ ${run.currentOrFailingNode.label}(${run.currentOrFailingNode.state})` : "";
       console.log(`${run.startedAt}  ${run.status}${node}  ${run.id}`);
     }
+  });
+}
+
+/** Decide the human gate a run is parked on. The default templates put an
+ *  operator-only approval in front of the heavy model — this is where the
+ *  operator (or an agent relaying the operator's explicit decision) answers. */
+export async function runWorkflowApprove(
+  workflowId: string,
+  runId: string,
+  opts: { json?: boolean; node?: string; reject?: boolean; note?: string },
+): Promise<void> {
+  const run = await gateway("GET", `/api/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}`) as {
+    revision: number;
+    approvals: Array<{ nodeId: string; status: string }>;
+  };
+  const pending = run.approvals.filter((approval) => approval.status === "pending");
+  let nodeId = opts.node;
+  if (!nodeId) {
+    if (pending.length === 0) fail(`run ${runId} に承認待ちのゲートはありません`);
+    if (pending.length > 1) fail(`承認待ちが複数あります: ${pending.map((item) => item.nodeId).join(", ")}。--node で指定してください`);
+    nodeId = pending[0]!.nodeId;
+  }
+  const decision = opts.reject ? "reject" : "approve";
+  const decided = await gateway("POST",
+    `/api/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/approval`,
+    { decision, decidedBy: "operator", expectedRevision: run.revision, ...(opts.note ? { note: opts.note } : {}) }) as { status: string };
+  emit(Boolean(opts.json), { workflowId, runId, nodeId, decision, runStatus: decided.status }, () => {
+    console.log(`${nodeId} を${decision === "approve" ? "承認" : "却下"}しました（run: ${decided.status}）`);
   });
 }
 

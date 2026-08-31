@@ -184,6 +184,21 @@ describe("workflow create --template", () => {
 });
 
 describe("reportCliFailure", () => {
+  it("emits machine-readable JSON for unexpected errors too", () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(String(line)); });
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as never);
+    try {
+      expect(() => reportCliFailure(new TypeError("boom"), true)).toThrow("exit");
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+    const parsed = JSON.parse(errors.join("\n")) as { error: string; unexpected: boolean };
+    expect(parsed).toMatchObject({ error: "boom", unexpected: true });
+  });
+
+
   it("emits machine-readable JSON on --json", async () => {
     const errors: string[] = [];
     const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(String(line)); });

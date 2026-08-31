@@ -21,6 +21,12 @@ export interface WorkflowDefinitionDetail extends WorkflowSummary {
   edges: Array<{ id: string; from: { nodeId: string; port: string }; to: { nodeId: string; port: string } }>
 }
 
+export interface WorkflowApprovalInfo {
+  nodeId: string
+  status: "pending" | "approved" | "rejected"
+  requestedAt: string
+}
+
 export interface WorkflowRunSummary {
   id: string
   workflowId: string
@@ -289,6 +295,13 @@ export const api = {
     post<{ id: string; status: string }>(`/api/workflows/${encodeURIComponent(id)}/runs`, { input: {} }),
   getWorkflowRuns: (id: string) =>
     get<{ items: WorkflowRunSummary[] }>(`/api/workflows/${encodeURIComponent(id)}/runs`),
+  getWorkflowRun: (id: string, runId: string) =>
+    get<{ revision: number; status: string; approvals: WorkflowApprovalInfo[] }>(
+      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`),
+  decideWorkflowApproval: (id: string, runId: string, nodeId: string, decision: "approve" | "reject", expectedRevision: number) =>
+    post<{ status: string }>(
+      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/approval`,
+      { decision, decidedBy: "operator", expectedRevision }),
   getAutomationTemplates: () =>
     get<{ templates: AutomationTemplateSpec[]; workflowsEnabled: boolean }>("/api/automation/templates"),
   createWorkflowFromTemplate: (templateId: string, data: { name: string; title?: string; vars: Record<string, string>; enable?: boolean }) =>

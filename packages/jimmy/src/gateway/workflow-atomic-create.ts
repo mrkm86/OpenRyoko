@@ -1,16 +1,18 @@
 /**
- * Atomic workflow creation — fork-specific gateway composition (not an upstream
- * file). Lives under gateway/ deliberately: the workflows runtime itself never
- * touches a raw database handle (see todo-capability-boundary.test.ts).
+ * Atomic workflow creation — fork-specific gateway composition (not an
+ * upstream file). Lives under gateway/ deliberately: the workflows runtime
+ * itself never touches a raw database handle (see
+ * todo-capability-boundary.test.ts).
  *
- * `createDefinition` → `saveDefinition` → `setEnabled` are three repository
- * transactions; a failure between them strands a skeleton (or disabled)
- * definition whose id then conflicts on retry. Wrapping the three service
- * calls in ONE better-sqlite3 transaction on the same connection turns the
- * inner transactions into savepoints, so any failure rolls the whole create
- * back to nothing.
+ * The three writes go through the REPOSITORY inside one better-sqlite3
+ * transaction (the inner repository transactions become savepoints), so any
+ * failure rolls the whole create back to nothing. Trigger re-arming and the
+ * definition-changed notification happen exactly once, AFTER the commit —
+ * never from inside the transaction, where they could observe (and act on) a
+ * state that is about to roll back.
  */
 import type Database from "better-sqlite3";
+import type { WorkflowRepository } from "../workflows/repository.js";
 import type { WorkflowService } from "../workflows/service.js";
 import type { WorkflowNode } from "../workflows/model.js";
 
@@ -31,22 +33,25 @@ export interface AtomicCreateResult {
 
 export function createWorkflowAtomically(
   database: Database.Database,
+  repository: WorkflowRepository,
   service: WorkflowService,
   input: AtomicCreateInput,
 ): AtomicCreateResult {
   const run = database.transaction(() => {
-    const created = service.createDefinition({
+    const created = repository.createDefinition({
       id: input.id, title: input.title,
       ...(input.description ? { description: input.description } : {}),
     });
-    const saved = service.saveDefinition(
+    const saved = repository.saveDefinition(
       { ...created, nodes: input.nodes, edges: input.edges } as never,
       created.revision,
     );
     const armed = input.enable
-      ? service.setEnabled({ id: saved.id, enabled: true, expectedRevision: saved.revision })
+      ? repository.setEnabled(saved.id, true, saved.revision)
       : saved;
     return { id: armed.id, revision: armed.revision, enabled: armed.enabled };
   });
-  return run.immediate();
+  const result = run.immediate();
+  service.definitionWritten(result.id);
+  return result;
 }

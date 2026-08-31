@@ -146,6 +146,17 @@ program
       await cli.runWorkflowStart(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
     });
   workflowCmd
+    .command("approve <id> <runId>")
+    .description("承認待ちの run を承認する（--reject で却下）")
+    .option("--node <nodeId>", "承認ノードID（承認待ちが複数ある時に指定）")
+    .option("--reject", "却下する")
+    .option("--note <note>", "決定のメモ")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, runId: string, opts: { json?: boolean; node?: string; reject?: boolean; note?: string }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowApprove(id, runId, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
     .command("runs <id>")
     .description("workflow の実行履歴を表示する")
     .option("--json", "JSON形式で出力")

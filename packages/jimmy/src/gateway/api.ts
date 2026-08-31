@@ -137,9 +137,12 @@ export interface ApiContext {
   authHome?: string;
   /** Present only when config.workflows.enabled — carries the Workflow engine. */
   workflowService?: WorkflowService;
-  /** The workflow store's own connection — atomic create wraps the service
-   *  calls in one transaction on it. Present alongside workflowService. */
+  /** The workflow store's own connection — atomic create wraps the repository
+   *  writes in one transaction on it. Present alongside workflowService. */
   workflowDatabase?: import("better-sqlite3").Database;
+  /** The workflow repository on that connection (atomic create writes through
+   *  it so no service-side notifications fire mid-transaction). */
+  workflowRepository?: import("../workflows/repository.js").WorkflowRepository;
 }
 
 export function resumePendingWebQueueItems(context: ApiContext): void {
@@ -510,7 +513,7 @@ export async function handleApiRequest(
       const templateParams = matchRoute("/api/automation/templates/:id", pathname);
       const isRawCreate = pathname === "/api/automation/definitions";
       if (method === "POST" && (templateParams || isRawCreate)) {
-        if (!context.workflowService || !context.workflowDatabase) {
+        if (!context.workflowService || !context.workflowDatabase || !context.workflowRepository) {
           return json(res, { error: "Workflow エンジンが無効です。config.workflows.enabled: true にして再起動してください。" }, 404);
         }
         const { isJsonMediaType } = await import("./media-type.js");
@@ -580,7 +583,7 @@ export async function handleApiRequest(
           if (!executable.ok) {
             return json(res, { error: "Workflow definition is not executable.", issues: executable.issues }, 422);
           }
-          const result = createWorkflowAtomically(context.workflowDatabase, context.workflowService, {
+          const result = createWorkflowAtomically(context.workflowDatabase, context.workflowRepository, context.workflowService, {
             id: name, title: (title as string | undefined) ?? name,
             ...(builtDescription ? { description: builtDescription } : {}),
             nodes: candidate.data.nodes, edges: candidate.data.edges,

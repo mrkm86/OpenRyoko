@@ -1153,6 +1153,7 @@ export async function startGateway(
           workflowService = undefined;
           apiContext.workflowService = undefined;
           apiContext.workflowDatabase = undefined;
+          apiContext.workflowRepository = undefined;
           logger.info("Workflow engine disabled via config reload");
         } else if (!previousWorkflowsEnabled && workflowsEnabled && !workflowService) {
           logger.warn("config.workflows.enabled was turned on — restart the gateway to start the Workflow engine");
@@ -1285,9 +1286,11 @@ export async function startGateway(
   if (currentConfig.workflows?.enabled) {
     sessionManager.setEmployeeProvider((id) => employeeRegistry.get(id));
     const workflowDatabase = openWorkflowDatabase();
+    const workflowRepository = new WorkflowRepository(workflowDatabase);
     apiContext.workflowDatabase = workflowDatabase;
+    apiContext.workflowRepository = workflowRepository;
     workflowService = new WorkflowService({
-      repository: new WorkflowRepository(workflowDatabase),
+      repository: workflowRepository,
       executor: new WorkflowSessionExecutor(sessionManager, (id) => {
         const session = getSession(id);
         if (!session) return null;

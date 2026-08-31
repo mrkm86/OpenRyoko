@@ -96,6 +96,7 @@ const WATCH_VARS = {
   employee: "ryoko",
   watchPrompt: "Gmail の受信箱に未返信の問い合わせがないか確認する",
   actPrompt: "返信案を書いて #inquiry に投稿する",
+  approval: "no", // the with-approval default gets its own routing tests below
 };
 
 describe("every template builds a definition the canonical validation accepts", () => {
@@ -105,6 +106,11 @@ describe("every template builds a definition the canonical validation accepts", 
     expect(definition.enabled).toBe(true);
     const kinds = definition.nodes.filter((node) => node.type === "trigger").map((node) => node.config.kind).sort();
     expect(kinds).toEqual(["manual", "schedule"]);
+    // approval: "no" was explicit — the DEFAULT build carries the human gate.
+    const withGate = buildTemplateBody("watch-then-act", { employee: "r", watchPrompt: "w", actPrompt: "a" });
+    const gate = withGate.nodes.find((node) => node.type === "approval");
+    expect(gate).toBeDefined();
+    expect((gate!.config as { operatorOnly?: boolean }).operatorOnly).toBe(true);
     // The act prompt reads the watcher's summary through the canonical
     // placeholder — fields live under `fields.` on a node output.
     const act = definition.nodes.find((node) => node.id === "act")!;
@@ -172,6 +178,52 @@ describe("watch-then-act routes through the real runner", () => {
   });
 });
 
+describe("the default approval gate blocks act until a human decides", () => {
+  const GATED_VARS = { employee: "ryoko", watchPrompt: "確認する", actPrompt: "投稿する" };
+
+  it("approve lets act run; the summary rides in the approval description", async () => {
+    saveBuilt("gated-approve", "watch-then-act", GATED_VARS);
+    const run = await service.startManual({ workflowId: "gated-approve", input: {} });
+    await vi.waitFor(() => expect(executor.commands.some((cmd) => cmd.owner.nodeId === "watch")).toBe(true));
+    await executor.succeed("watch", { needsAction: true, summary: "未返信2件" });
+
+    // The run parks on the human gate — act has NOT been dispatched.
+    await vi.waitFor(() => {
+      const detail = service.getRun("gated-approve", run.id)!;
+      expect(detail.approvals.some((approval) => approval.nodeId === "approve" && approval.status === "pending")).toBe(true);
+    });
+    expect(executor.commands.some((cmd) => cmd.owner.nodeId === "act")).toBe(false);
+
+    const parked = service.getRun("gated-approve", run.id)!;
+    await service.decideApproval({
+      workflowId: "gated-approve", runId: run.id, nodeId: "approve",
+      decision: "approve", decidedBy: "operator", expectedRevision: parked.revision,
+    });
+    await vi.waitFor(() => expect(executor.commands.some((cmd) => cmd.owner.nodeId === "act")).toBe(true));
+  });
+
+  it("reject ends the run without ever dispatching act", async () => {
+    saveBuilt("gated-reject", "watch-then-act", GATED_VARS);
+    const run = await service.startManual({ workflowId: "gated-reject", input: {} });
+    await vi.waitFor(() => expect(executor.commands.some((cmd) => cmd.owner.nodeId === "watch")).toBe(true));
+    await executor.succeed("watch", { needsAction: true, summary: "怪しい内容" });
+    await vi.waitFor(() => {
+      const detail = service.getRun("gated-reject", run.id)!;
+      expect(detail.approvals.some((approval) => approval.status === "pending")).toBe(true);
+    });
+    const parked = service.getRun("gated-reject", run.id)!;
+    await service.decideApproval({
+      workflowId: "gated-reject", runId: run.id, nodeId: "approve",
+      decision: "reject", decidedBy: "operator", expectedRevision: parked.revision,
+    });
+    await vi.waitFor(() => {
+      const runs = service.listRuns("gated-reject", {});
+      expect(runs.items[0]!.status).toBe("completed");
+    });
+    expect(executor.commands.some((cmd) => cmd.owner.nodeId === "act")).toBe(false);
+  });
+});
+
 describe("a schedule fire routes through the merge gate", () => {
   it("a run created on the schedule trigger reaches the watch node", async () => {
     saveBuilt("sched-gate", "watch-then-act", WATCH_VARS);
@@ -199,12 +251,12 @@ describe("atomic create leaves nothing behind on failure", () => {
     const body = buildTemplateBody("scheduled-report", {
       employee: "ryoko", schedule: "0 7 * * *", prompt: "報告する",
     });
-    // An edge referencing a node that does not exist fails saveDefinition —
+    // A duplicate node id fails the definition schema inside saveDefinition —
     // one transaction means the createDefinition before it unwinds too.
-    const brokenEdges = [...body.edges, { id: "e-broken", from: { nodeId: "ghost", port: "success" }, to: { nodeId: "done", port: "input" } }];
-    expect(() => createWorkflowAtomically(database, service, {
-      id: "atomic-broken", title: "atomic-broken", nodes: body.nodes,
-      edges: brokenEdges as never, enable: true,
+    const brokenNodes = [...body.nodes, body.nodes[0]!];
+    expect(() => createWorkflowAtomically(database, repository, service, {
+      id: "atomic-broken", title: "atomic-broken", nodes: brokenNodes,
+      edges: body.edges as never, enable: true,
     })).toThrow();
     expect(repository.getDefinition("atomic-broken") ?? null).toBeNull();
   });
@@ -213,7 +265,7 @@ describe("atomic create leaves nothing behind on failure", () => {
     const body = buildTemplateBody("scheduled-report", {
       employee: "ryoko", schedule: "0 7 * * *", prompt: "報告する",
     });
-    const result = createWorkflowAtomically(database, service, {
+    const result = createWorkflowAtomically(database, repository, service, {
       id: "atomic-ok", title: "atomic-ok", description: body.description,
       nodes: body.nodes, edges: body.edges as never, enable: true,
     });

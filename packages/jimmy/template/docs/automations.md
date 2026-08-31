@@ -43,6 +43,11 @@ ryoko workflow create --file definition.json --name my-flow --json
 ryoko workflow show inquiry-watch --json
 ryoko workflow run inquiry-watch --json
 ryoko workflow runs inquiry-watch --json
+
+# Decide a run parked on its human approval gate (watch-then-act default).
+# Only relay an approval the human operator actually gave.
+ryoko workflow approve inquiry-watch <runId> --json
+ryoko workflow approve inquiry-watch <runId> --reject --note "内容が怪しい"
 ```
 
 Raw API access (same routes the UI uses) is always available as a fallback:
@@ -78,13 +83,22 @@ occurrence. The event payload is available to prompts as
 
 ## Security note for `watch-then-act`
 
-The watcher reads external data (mail, channels, feeds). Its summary is passed
-to the heavy model wrapped as explicitly-untrusted data (instructions first,
-data last, the data block never closes), and template variables refuse `{{ }}`
-placeholders — but prompt-level boundaries are mitigations, not guarantees.
-Keep `watchPrompt` read-only, and if `actPrompt` posts or sends anything
-outward, prefer routing the result to a human channel for review instead of
-acting directly on third-party content.
+The watcher reads external data (mail, channels, feeds), and external data can
+contain adversarial instructions. Two layers stand between that and side
+effects:
+
+1. **A structural gate (default ON)**: the template puts an operator-only
+   Approval node in front of the heavy model. Whatever the summary says,
+   nothing runs until a human decides (`ryoko workflow approve`, or the
+   承認/却下 buttons on the automation page). Set `approval=no` only for
+   flows whose act step is harmless if misdirected.
+2. **Prompt-level mitigations**: the summary is wrapped as explicitly-untrusted
+   data (instructions first, data last, the data block never closes), and
+   template variables refuse `{{ }}` placeholders.
+
+Layer 2 is a mitigation, not a guarantee — keep `watchPrompt` read-only, and
+keep layer 1 on for anything that posts or sends outward. An agent relaying an
+approval must only do so when the human operator has actually decided.
 
 ## Choosing between a cron job and a workflow
 

@@ -63,6 +63,7 @@ export const AUTOMATION_TEMPLATES: AutomationTemplate[] = [
       { key: "heavyEngine", label: "実行エンジン", hint: "本処理のエンジン", required: false, default: "claude", options: ["claude", "codex", "gemini"] },
       { key: "heavyModel", label: "実行モデル", hint: "本処理のモデル（例: opus）", required: false, default: "opus" },
       { key: "heavyEffort", label: "実行 effort", hint: "low / medium / high / xhigh", required: false, default: "high", options: ["low", "medium", "high", "xhigh"] },
+      { key: "approval", label: "実行前の承認", hint: "yes = 重いモデルが動く前に人間の承認を挟む（推奨・既定）。no = 判定が通れば即実行", required: false, default: "yes", options: ["yes", "no"] },
       { key: "timezone", label: "タイムゾーン", hint: "IANA 名", required: false, default: "Asia/Tokyo" },
     ],
   },
@@ -224,6 +225,15 @@ export function buildTemplateBody(templateId: string, vars: Record<string, strin
           defaultPort: "skip",
         },
       },
+      ...(v.approval === "no" ? [] : [{
+        id: "approve", type: "approval" as const, name: "実行の承認", config: {
+          // The gate that makes the injection boundary STRUCTURAL: whatever the
+          // watcher's summary says, nothing with side effects runs until a
+          // human has seen it. operatorOnly keeps the decision off the agents.
+          description: "判定係が対応が必要と判断しました。要約を確認し、実行して良ければ承認してください。要約: {{ node.watch.fields.summary }}",
+          operatorOnly: true,
+        },
+      }]),
       {
         id: "act", type: "employee", name: "実行", config: {
           employee: fixed(v.employee!),
@@ -240,18 +250,25 @@ export function buildTemplateBody(templateId: string, vars: Record<string, strin
       },
       { id: "done", type: "end", name: "完了", config: { result: "success" } },
       { id: "skipped", type: "end", name: "対応不要", config: { result: "success", message: "対応不要と判定" } },
+      ...(v.approval === "no" ? [] : [{ id: "rejected", type: "end" as const, name: "却下", config: { result: "success" as const, message: "承認されなかったため実行せず" } }]),
     ];
     const edges: WorkflowEdge[] = [
       { id: "e-start-gate", from: { nodeId: "start", port: "success" }, to: { nodeId: "gate", port: "input" } },
       { id: "e-manual-gate", from: { nodeId: "manual", port: "success" }, to: { nodeId: "gate", port: "input" } },
       { id: "e-gate-watch", from: { nodeId: "gate", port: "success" }, to: { nodeId: "watch", port: "input" } },
       { id: "e-watch-decide", from: { nodeId: "watch", port: "success" }, to: { nodeId: "decide", port: "input" } },
-      { id: "e-decide-act", from: { nodeId: "decide", port: "act" }, to: { nodeId: "act", port: "input" } },
+      ...(v.approval === "no"
+        ? [{ id: "e-decide-act", from: { nodeId: "decide", port: "act" }, to: { nodeId: "act", port: "input" as const } }]
+        : [
+          { id: "e-decide-approve", from: { nodeId: "decide", port: "act" }, to: { nodeId: "approve", port: "input" as const } },
+          { id: "e-approve-act", from: { nodeId: "approve", port: "approved" }, to: { nodeId: "act", port: "input" as const } },
+          { id: "e-approve-rejected", from: { nodeId: "approve", port: "rejected" }, to: { nodeId: "rejected", port: "input" as const } },
+        ]),
       { id: "e-decide-skip", from: { nodeId: "decide", port: "skip" }, to: { nodeId: "skipped", port: "input" } },
       { id: "e-act-done", from: { nodeId: "act", port: "success" }, to: { nodeId: "done", port: "input" } },
     ];
     return {
-      description: `${v.interval} ごとに見張り、必要な時だけ ${v.heavyEngine}/${v.heavyModel} で対応（テンプレート: 見張り型）`,
+      description: `${v.interval} ごとに見張り、必要な時だけ${v.approval === "no" ? "" : "承認を経て"} ${v.heavyEngine}/${v.heavyModel} で対応（テンプレート: 見張り型）`,
       nodes, edges,
     };
   }

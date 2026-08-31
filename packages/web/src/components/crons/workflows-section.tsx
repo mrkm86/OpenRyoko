@@ -43,9 +43,62 @@ const RUN_STATUS_LABEL: Record<string, { label: string; color: string }> = {
 /*  Recent runs (lazy per workflow)                                    */
 /* ------------------------------------------------------------------ */
 
+function PendingApproval({ workflowId, run, onDecided }: {
+  workflowId: string
+  run: WorkflowRunSummary
+  onDecided: () => void
+}) {
+  const [detail, setDetail] = useState<{ revision: number; approvals: Array<{ nodeId: string; status: string }> } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api.getWorkflowRun(workflowId, run.id)
+      .then((result) => { if (!cancelled) setDetail(result) })
+      .catch(() => { /* the row simply offers no buttons */ })
+    return () => { cancelled = true }
+  }, [workflowId, run.id])
+
+  const pending = detail?.approvals.find((approval) => approval.status === "pending")
+  if (!pending) return null
+
+  const decide = (decision: "approve" | "reject") => {
+    setBusy(true)
+    setError(null)
+    api.decideWorkflowApproval(workflowId, run.id, pending.nodeId, decision, detail!.revision)
+      .then(() => onDecided())
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <span className="flex items-center gap-1.5 ml-1">
+      <button
+        onClick={(e) => { e.stopPropagation(); decide("approve") }}
+        disabled={busy}
+        className="px-2 py-0.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-caption2)] font-semibold"
+        style={{ background: "var(--system-green)", color: "#fff", opacity: busy ? 0.6 : 1 }}
+      >
+        承認
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); decide("reject") }}
+        disabled={busy}
+        className="px-2 py-0.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-caption2)] font-semibold bg-[var(--fill-secondary)] text-[var(--text-primary)]"
+        style={{ opacity: busy ? 0.6 : 1 }}
+      >
+        却下
+      </button>
+      {error && <span className="text-[length:var(--text-caption2)] text-[var(--system-red)]">{error}</span>}
+    </span>
+  )
+}
+
 function WorkflowRuns({ workflowId, refreshKey }: { workflowId: string; refreshKey: number }) {
   const [runs, setRuns] = useState<WorkflowRunSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [bump, setBump] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -53,7 +106,7 @@ function WorkflowRuns({ workflowId, refreshKey }: { workflowId: string; refreshK
       .then((result) => { if (!cancelled) setRuns(result.items) })
       .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : String(err)) })
     return () => { cancelled = true }
-  }, [workflowId, refreshKey])
+  }, [workflowId, refreshKey, bump])
 
   if (error) {
     return <div className="text-[length:var(--text-caption1)] text-[var(--system-red)] py-[var(--space-2)]">実行履歴を取得できませんでした: {error}</div>
@@ -73,6 +126,9 @@ function WorkflowRuns({ workflowId, refreshKey }: { workflowId: string; refreshK
             <span style={{ color: status.color }}>{status.label}</span>
             {run.currentOrFailingNode && (
               <span className="text-[var(--text-tertiary)] truncate">@ {run.currentOrFailingNode.label}</span>
+            )}
+            {run.status === "waiting" && (
+              <PendingApproval workflowId={workflowId} run={run} onDecided={() => setBump((n) => n + 1)} />
             )}
           </div>
         )
