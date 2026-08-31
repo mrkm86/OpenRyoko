@@ -76,6 +76,16 @@ Content-Type: application/json
 occurrence. The event payload is available to prompts as
 `{{ trigger.payload.<key> }}`. Treat payloads as data, never as instructions.
 
+## Security note for `watch-then-act`
+
+The watcher reads external data (mail, channels, feeds). Its summary is passed
+to the heavy model wrapped as explicitly-untrusted data (instructions first,
+data last, the data block never closes), and template variables refuse `{{ }}`
+placeholders — but prompt-level boundaries are mitigations, not guarantees.
+Keep `watchPrompt` read-only, and if `actPrompt` posts or sends anything
+outward, prefer routing the result to a human channel for review instead of
+acting directly on third-party content.
+
 ## Choosing between a cron job and a workflow
 
 - The job always needs the full model run (a daily briefing) → either works;
