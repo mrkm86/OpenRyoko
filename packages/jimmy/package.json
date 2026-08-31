@@ -14,10 +14,12 @@
   "types": "./dist/src/index.d.ts",
   "files": [
     "dist/",
-    "template/"
+    "template/",
+    "scripts/"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -r assets dist/assets && cp -r ../web/out dist/web",
+    "postinstall": "node scripts/fix-prebuild-permissions.mjs",
     "dev": "tsc && (tsc --watch &) && node --watch-path=dist dist/bin/jimmy.js start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
