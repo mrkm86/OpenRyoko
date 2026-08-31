@@ -491,6 +491,55 @@ export async function handleApiRequest(
         { service: context.workflowService, authenticated })) return;
     }
 
+    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
+    // Lives outside /api/workflows so a definition id can never shadow it.
+    if (method === "GET" && pathname === "/api/automation/templates") {
+      const { AUTOMATION_TEMPLATES } = await import("../workflows/templates.js");
+      return json(res, { templates: AUTOMATION_TEMPLATES, workflowsEnabled: Boolean(context.workflowService) });
+    }
+
+    // POST /api/automation/templates/:id — build from a template and save (and
+    // optionally enable) in one request, so the UI and agents get an atomic
+    // create instead of stitching three calls together.
+    {
+      const templateParams = matchRoute("/api/automation/templates/:id", pathname);
+      if (method === "POST" && templateParams) {
+        if (!context.workflowService) {
+          return json(res, { error: "Workflow エンジンが無効です。config.workflows.enabled: true にして再起動してください。" }, 404);
+        }
+        const body = await readBody(req);
+        let parsed: { name?: string; title?: string; vars?: Record<string, string>; enable?: boolean };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          return badRequest(res, "Request body must be JSON");
+        }
+        if (!parsed.name || typeof parsed.name !== "string") {
+          return badRequest(res, "name is required (workflow id, alphanumeric + hyphen)");
+        }
+        const { buildTemplateBody, TemplateError } = await import("../workflows/templates.js");
+        try {
+          const built = buildTemplateBody(templateParams.id, parsed.vars ?? {});
+          const created = context.workflowService.createDefinition({
+            id: parsed.name, title: parsed.title ?? parsed.name, description: built.description,
+          });
+          const saved = context.workflowService.saveDefinition(
+            { ...created, nodes: built.nodes, edges: built.edges } as never,
+            created.revision,
+          );
+          const armed = parsed.enable
+            ? context.workflowService.setEnabled({ id: saved.id, enabled: true, expectedRevision: saved.revision })
+            : saved;
+          return json(res, { id: armed.id, revision: armed.revision, enabled: armed.enabled }, 201);
+        } catch (error) {
+          if (error instanceof TemplateError) return json(res, { error: error.message }, 422);
+          const message = error instanceof Error ? error.message : String(error);
+          const issues = (error as { issues?: unknown }).issues;
+          return json(res, { error: message, ...(issues ? { issues } : {}) }, 422);
+        }
+      }
+    }
+
     // POST /api/internal/hook — receive Claude Code turn hooks from hook-relay.mjs
     // (interactive PTY engine). Loopback-only + shared-secret authenticated.
     if (method === "POST" && pathname === "/api/internal/hook") {

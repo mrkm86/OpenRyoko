@@ -2268,7 +2268,12 @@ export default function SettingsPage() {
               </Section>
 
               {/* -- Section 6: Cron -- */}
-              <Section title="Cron">
+              <Section title="自動化の通知">
+                <div
+                  className="text-[length:var(--text-caption2)] text-[var(--text-tertiary)] mb-[var(--space-3)]"
+                >
+                  ジョブの作成・有効化・実行は<a href="/cron" className="text-[var(--accent)] underline">自動化ページ</a>で行います。ここは通知の既定値だけを設定します。
+                </div>
                 <div
                   className="text-[length:var(--text-caption1)] font-[var(--weight-semibold)] text-[var(--text-tertiary)] mb-[var(--space-2)]"
                 >

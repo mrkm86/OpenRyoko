@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { WeeklySchedule } from "@/components/crons/weekly-schedule"
 import { PipelineGraph } from "@/components/crons/pipeline-graph"
 import { EmployeeAvatar } from "@/components/ui/employee-avatar"
+import { WorkflowsSection } from "@/components/crons/workflows-section"
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -168,6 +169,8 @@ export default function CronPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [updatedAgo, setUpdatedAgo] = useState("just now")
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
+  const [wfCreating, setWfCreating] = useState(false)
+  const [wfCount, setWfCount] = useState(0)
   const [triggeringId, setTriggeringId] = useState<string | null>(null)
   const [employeeMap, setEmployeeMap] = useState<Map<string, Employee>>(new Map())
 
@@ -253,16 +256,23 @@ export default function CronPage() {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-[length:var(--text-title1)] font-bold text-[var(--text-primary)] tracking-tight leading-[1.2]">
-                Cron Jobs
+                自動化
               </h1>
               {!loading && (
                 <p className="text-[length:var(--text-footnote)] text-[var(--text-secondary)] mt-[var(--space-1)]">
-                  {jobs.length} total &middot; {enabledCount} enabled &middot; {disabledCount} disabled
+                  cron {jobs.length} 件{wfCount > 0 ? <> &middot; ワークフロー {wfCount} 件</> : null} &middot; 有効 {enabledCount} &middot; 無効 {disabledCount}
                 </p>
               )}
             </div>
             <ToolbarActions>
               <div className="flex items-center gap-[var(--space-3)]">
+                <button
+                  onClick={() => setWfCreating(true)}
+                  className="px-3.5 py-1.5 rounded-[var(--radius-sm)] border-none cursor-pointer text-[length:var(--text-footnote)] font-semibold"
+                  style={{ background: "var(--accent)", color: "var(--accent-contrast)" }}
+                >
+                  ＋ 新規作成
+                </button>
                 <span className="text-[length:var(--text-caption1)] text-[var(--text-tertiary)]">
                   Updated {updatedAgo}
                 </span>
@@ -323,6 +333,13 @@ export default function CronPage() {
                   <SummaryCard label="有効" value={enabledCount} color="var(--system-green)" />
                   <SummaryCard label="無効" value={disabledCount} color="var(--text-tertiary)" />
                 </div>
+
+                {/* Workflows live in the same list view, above the cron groups */}
+                <WorkflowsSection
+                  creating={wfCreating}
+                  onCloseCreate={() => setWfCreating(false)}
+                  onCountChange={setWfCount}
+                />
 
                 {/* Filter pills */}
                 <div className="flex items-center gap-[var(--space-2)] mb-[var(--space-3)]">

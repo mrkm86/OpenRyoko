@@ -1,3 +1,53 @@
+export interface WorkflowSummary {
+  id: string
+  title: string
+  description: string | null
+  revision: number
+  enabled: boolean
+  retiredAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkflowNodeSummary {
+  id: string
+  type: string
+  name: string
+  config: Record<string, unknown>
+}
+
+export interface WorkflowDefinitionDetail extends WorkflowSummary {
+  nodes: WorkflowNodeSummary[]
+  edges: Array<{ id: string; from: { nodeId: string; port: string }; to: { nodeId: string; port: string } }>
+}
+
+export interface WorkflowRunSummary {
+  id: string
+  workflowId: string
+  status: string
+  trigger: { nodeId: string; kind: string }
+  startedAt: string
+  endedAt: string | null
+  currentOrFailingNode: { nodeId: string; label: string; state: "current" | "failing" } | null
+}
+
+export interface AutomationTemplateVariable {
+  key: string
+  label: string
+  hint: string
+  required: boolean
+  default?: string
+  options?: string[]
+}
+
+export interface AutomationTemplateSpec {
+  id: string
+  name: string
+  when: string
+  flow: string
+  variables: AutomationTemplateVariable[]
+}
+
 export interface TranscriptContentBlock {
   type: 'text' | 'tool_use' | 'tool_result' | 'thinking'
   text?: string
@@ -228,6 +278,19 @@ export const api = {
     post<{ status: string; sessionId: string }>(`/api/sessions/${id}/stop`, {}),
   resetSession: (id: string) =>
     post<{ status: string; sessionId: string }>(`/api/sessions/${id}/reset`, {}),
+  // --- Workflows (automation hub) ---
+  getWorkflows: () => get<WorkflowSummary[]>("/api/workflows"),
+  getWorkflow: (id: string) => get<WorkflowDefinitionDetail>(`/api/workflows/${encodeURIComponent(id)}`),
+  setWorkflowEnabled: (id: string, enabled: boolean, expectedRevision: number) =>
+    post<WorkflowSummary>(`/api/workflows/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, { expectedRevision }),
+  startWorkflowRun: (id: string) =>
+    post<{ id: string; status: string }>(`/api/workflows/${encodeURIComponent(id)}/runs`, { input: {} }),
+  getWorkflowRuns: (id: string) =>
+    get<{ items: WorkflowRunSummary[] }>(`/api/workflows/${encodeURIComponent(id)}/runs`),
+  getAutomationTemplates: () =>
+    get<{ templates: AutomationTemplateSpec[]; workflowsEnabled: boolean }>("/api/automation/templates"),
+  createWorkflowFromTemplate: (templateId: string, data: { name: string; title?: string; vars: Record<string, string>; enable?: boolean }) =>
+    post<{ id: string; revision: number; enabled: boolean }>(`/api/automation/templates/${encodeURIComponent(templateId)}`, data),
   getCronJobs: () => get<Record<string, unknown>[]>("/api/cron"),
   createCronJob: (data: Record<string, unknown>) =>
     post<Record<string, unknown>>("/api/cron", data),
