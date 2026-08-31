@@ -194,7 +194,20 @@ describe("the default approval gate blocks act until a human decides", () => {
     });
     expect(executor.commands.some((cmd) => cmd.owner.nodeId === "act")).toBe(false);
 
+    // The approval surfaces (web buttons / CLI) read the watcher's report off
+    // the run detail by walking upstream past the Condition (whose output is
+    // only its chosen port) to the nearest node that reported real fields.
     const parked = service.getRun("gated-approve", run.id)!;
+    let report: Record<string, unknown> | undefined;
+    let cursor = "approve";
+    for (let hop = 0; hop < 5; hop += 1) {
+      const source = parked.definition.edges.find((edge) => edge.to.nodeId === cursor)?.from.nodeId;
+      if (!source) break;
+      const fields = parked.nodeRuns.find((nodeRun) => nodeRun.nodeId === source)?.output?.fields;
+      if (fields && Object.keys(fields).filter((key) => key !== "port").length > 0) { report = fields; break }
+      cursor = source;
+    }
+    expect(report).toMatchObject({ needsAction: true, summary: "未返信2件" });
     await service.decideApproval({
       workflowId: "gated-approve", runId: run.id, nodeId: "approve",
       decision: "approve", decidedBy: "operator", expectedRevision: parked.revision,
@@ -259,6 +272,32 @@ describe("atomic create leaves nothing behind on failure", () => {
       edges: body.edges as never, enable: true,
     })).toThrow();
     expect(repository.getDefinition("atomic-broken") ?? null).toBeNull();
+  });
+
+  it("notifies exactly once after commit, and never on rollback", () => {
+    const onDefinitionChange = vi.fn();
+    const spyService = new WorkflowService({
+      repository, executor: executor as unknown as WorkflowSessionExecutor,
+      employees: () => new Map([[employee.name, employee]]), models: () => models,
+      onDefinitionChange,
+    });
+    try {
+      const body = buildTemplateBody("scheduled-report", {
+        employee: "ryoko", schedule: "0 7 * * *", prompt: "報告する",
+      });
+      createWorkflowAtomically(database, repository, spyService, {
+        id: "notify-once", title: "notify-once", nodes: body.nodes, edges: body.edges as never, enable: true,
+      });
+      expect(onDefinitionChange).toHaveBeenCalledTimes(1);
+
+      const brokenNodes = [...body.nodes, body.nodes[0]!];
+      expect(() => createWorkflowAtomically(database, repository, spyService, {
+        id: "notify-never", title: "notify-never", nodes: brokenNodes, edges: body.edges as never, enable: true,
+      })).toThrow();
+      expect(onDefinitionChange).toHaveBeenCalledTimes(1); // still one — nothing fired for the rollback
+    } finally {
+      spyService.dispose();
+    }
   });
 
   it("creates, saves, and enables in one call when the body is sound", () => {

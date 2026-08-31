@@ -330,18 +330,40 @@ export async function runWorkflowRuns(id: string, opts: { json?: boolean }): Pro
   });
 }
 
+interface RunDetailForApproval {
+  revision: number;
+  approvals: Array<{ nodeId: string; status: string }>;
+  definition?: { edges: Array<{ from: { nodeId: string }; to: { nodeId: string } }> };
+  nodeRuns: Array<{ nodeId: string; output?: { fields?: Record<string, unknown> } }>;
+}
+
+/** The upstream output the pending gate is deciding ON — external, unverified
+ *  content by construction. Walks back past pass-through nodes (a Condition
+ *  outputs only its chosen port) to the nearest node that reported fields. */
+function approvalContext(run: RunDetailForApproval, nodeId: string): Record<string, unknown> | undefined {
+  let current = nodeId;
+  for (let hop = 0; hop < 5; hop += 1) {
+    const source = run.definition?.edges.find((edge) => edge.to.nodeId === current)?.from.nodeId;
+    if (!source) return undefined;
+    const fields = run.nodeRuns.find((nodeRun) => nodeRun.nodeId === source)?.output?.fields;
+    if (fields && Object.keys(fields).filter((key) => key !== "port").length > 0) return fields;
+    current = source;
+  }
+  return undefined;
+}
+
 /** Decide the human gate a run is parked on. The default templates put an
  *  operator-only approval in front of the heavy model — this is where the
- *  operator (or an agent relaying the operator's explicit decision) answers. */
+ *  operator (or an agent relaying the operator's explicit decision) answers.
+ *  The gateway stamps who decided from the request itself (no caller header =
+ *  operator), so the body carries only decision/reason/expectedRevision. */
 export async function runWorkflowApprove(
   workflowId: string,
   runId: string,
   opts: { json?: boolean; node?: string; reject?: boolean; note?: string },
 ): Promise<void> {
-  const run = await gateway("GET", `/api/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}`) as {
-    revision: number;
-    approvals: Array<{ nodeId: string; status: string }>;
-  };
+  const run = await gateway("GET",
+    `/api/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}?view=full`) as RunDetailForApproval;
   const pending = run.approvals.filter((approval) => approval.status === "pending");
   let nodeId = opts.node;
   if (!nodeId) {
@@ -349,11 +371,18 @@ export async function runWorkflowApprove(
     if (pending.length > 1) fail(`承認待ちが複数あります: ${pending.map((item) => item.nodeId).join(", ")}。--node で指定してください`);
     nodeId = pending[0]!.nodeId;
   }
+  const context = approvalContext(run, nodeId);
+  if (!opts.json && context) {
+    console.log("判定係の報告（外部由来・未検証の内容です）:");
+    for (const [key, value] of Object.entries(context)) {
+      console.log(`  ${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+    }
+  }
   const decision = opts.reject ? "reject" : "approve";
   const decided = await gateway("POST",
     `/api/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/approval`,
-    { decision, decidedBy: "operator", expectedRevision: run.revision, ...(opts.note ? { note: opts.note } : {}) }) as { status: string };
-  emit(Boolean(opts.json), { workflowId, runId, nodeId, decision, runStatus: decided.status }, () => {
+    { decision, expectedRevision: run.revision, ...(opts.note ? { reason: opts.note } : {}) }) as { status: string };
+  emit(Boolean(opts.json), { workflowId, runId, nodeId, decision, runStatus: decided.status, ...(context ? { context } : {}) }, () => {
     console.log(`${nodeId} を${decision === "approve" ? "承認" : "却下"}しました（run: ${decided.status}）`);
   });
 }

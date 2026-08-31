@@ -27,6 +27,14 @@ export interface WorkflowApprovalInfo {
   requestedAt: string
 }
 
+export interface WorkflowRunDetailForApproval {
+  revision: number
+  status: string
+  approvals: WorkflowApprovalInfo[]
+  definition?: { edges: Array<{ from: { nodeId: string }; to: { nodeId: string } }> }
+  nodeRuns: Array<{ nodeId: string; output?: { fields?: Record<string, unknown> } }>
+}
+
 export interface WorkflowRunSummary {
   id: string
   workflowId: string
@@ -296,12 +304,15 @@ export const api = {
   getWorkflowRuns: (id: string) =>
     get<{ items: WorkflowRunSummary[] }>(`/api/workflows/${encodeURIComponent(id)}/runs`),
   getWorkflowRun: (id: string, runId: string) =>
-    get<{ revision: number; status: string; approvals: WorkflowApprovalInfo[] }>(
-      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`),
+    get<WorkflowRunDetailForApproval>(
+      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}?view=full`),
+  // Who decided is stamped by the gateway from the request itself (a browser
+  // call carries no caller-session header → operator), so the body carries
+  // only the decision.
   decideWorkflowApproval: (id: string, runId: string, nodeId: string, decision: "approve" | "reject", expectedRevision: number) =>
     post<{ status: string }>(
       `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/approval`,
-      { decision, decidedBy: "operator", expectedRevision }),
+      { decision, expectedRevision }),
   getAutomationTemplates: () =>
     get<{ templates: AutomationTemplateSpec[]; workflowsEnabled: boolean }>("/api/automation/templates"),
   createWorkflowFromTemplate: (templateId: string, data: { name: string; title?: string; vars: Record<string, string>; enable?: boolean }) =>

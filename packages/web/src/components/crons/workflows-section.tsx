@@ -48,7 +48,7 @@ function PendingApproval({ workflowId, run, onDecided }: {
   run: WorkflowRunSummary
   onDecided: () => void
 }) {
-  const [detail, setDetail] = useState<{ revision: number; approvals: Array<{ nodeId: string; status: string }> } | null>(null)
+  const [detail, setDetail] = useState<import("@/lib/api").WorkflowRunDetailForApproval | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -63,6 +63,21 @@ function PendingApproval({ workflowId, run, onDecided }: {
   const pending = detail?.approvals.find((approval) => approval.status === "pending")
   if (!pending) return null
 
+  // What the human is deciding ON: the nearest upstream output with real
+  // fields (a Condition only reports its chosen port) — external, unverified
+  // content by construction. Rendered as plain text only.
+  let context: Record<string, unknown> | undefined
+  {
+    let current = pending.nodeId
+    for (let hop = 0; hop < 5 && detail; hop += 1) {
+      const source = detail.definition?.edges.find((edge) => edge.to.nodeId === current)?.from.nodeId
+      if (!source) break
+      const fields = detail.nodeRuns.find((nodeRun) => nodeRun.nodeId === source)?.output?.fields
+      if (fields && Object.keys(fields).filter((key) => key !== "port").length > 0) { context = fields; break }
+      current = source
+    }
+  }
+
   const decide = (decision: "approve" | "reject") => {
     setBusy(true)
     setError(null)
@@ -73,7 +88,15 @@ function PendingApproval({ workflowId, run, onDecided }: {
   }
 
   return (
-    <span className="flex items-center gap-1.5 ml-1">
+    <span className="flex flex-wrap items-center gap-1.5 ml-1">
+      {context && (
+        <span className="basis-full text-[length:var(--text-caption2)] text-[var(--text-secondary)] whitespace-pre-wrap">
+          <span className="text-[var(--system-orange)] font-semibold">外部由来・未検証の報告: </span>
+          {Object.entries(context)
+            .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+            .join(" / ")}
+        </span>
+      )}
       <button
         onClick={(e) => { e.stopPropagation(); decide("approve") }}
         disabled={busy}
