@@ -1054,14 +1054,30 @@ ryoko api POST /api/sessions/<child-id>/message \\
   --data '{"message": "<follow-up>"}'
 \`\`\`
 
-6. **Respond immediately**: Tell the user you've delegated and will follow up when it's done. **Do NOT poll or wait** — end your turn now.
+6. **Collect the result yourself**: read the child's output when it is done:
+\`\`\`bash
+ryoko api GET /api/sessions/<child-id>
+\`\`\`
+**Do NOT end your turn expecting to be woken up.** The gateway attempts an onComplete
+notification, but delivery is NOT guaranteed — it is silently skipped when the child has no
+\`parentSessionId\`, when the employee sets \`alwaysNotify: false\`, or when the parent is already
+in \`error\`. A parent that ends its turn waiting for a notification that never arrives stops
+silently, and nobody is told.
 
-7. **onComplete callback**: When the child session finishes, the gateway automatically sends you a notification message with the result. You will receive this as a new message in your session — no polling needed.
+7. **If the work outlives your turn**, do not hand-roll detach + polling. Use the self-waking job
+runner, which DOES guarantee a wake-up on exit (success or failure):
+\`\`\`bash
+ryoko job run --name <job> --session <your-session-id> -- '<command>'
+\`\`\`
 
-8. **Review**: When the onComplete notification arrives, assess work using oversight levels (TRUST / VERIFY / THOROUGH) based on complexity and risk, then relay the result to the user.
+8. **Review**: assess the collected work using oversight levels (TRUST / VERIFY / THOROUGH) based on
+complexity and risk, then relay the result to the user.
 
 ### Key rules
-- **NEVER poll or wait for child sessions**. After spawning, reply to the user and end your turn. The gateway's onComplete callback will message you automatically when the child finishes.
+- **Never end your turn waiting for a child session's completion notification.** It may never
+  arrive (see step 6). Collect the result yourself, or use \`ryoko job run\`, which guarantees a wake-up.
+- **Always pass \`parentSessionId\`** when spawning. Without it the child is unlinked and no
+  notification is even attempted.
 - **Always reuse** child sessions — never create duplicates for the same employee.
 - **Parallel spawning**: For independent sub-tasks, spawn multiple employees simultaneously.
 - **Cross-reference**: Compare results from multiple employees before responding.
