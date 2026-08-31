@@ -1,3 +1,67 @@
+export interface WorkflowSummary {
+  id: string
+  title: string
+  description: string | null
+  revision: number
+  enabled: boolean
+  retiredAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkflowNodeSummary {
+  id: string
+  type: string
+  name: string
+  config: Record<string, unknown>
+}
+
+export interface WorkflowDefinitionDetail extends WorkflowSummary {
+  nodes: WorkflowNodeSummary[]
+  edges: Array<{ id: string; from: { nodeId: string; port: string }; to: { nodeId: string; port: string } }>
+}
+
+export interface WorkflowApprovalInfo {
+  nodeId: string
+  status: "pending" | "approved" | "rejected"
+  requestedAt: string
+}
+
+export interface WorkflowRunDetailForApproval {
+  revision: number
+  status: string
+  approvals: WorkflowApprovalInfo[]
+  definition?: { edges: Array<{ from: { nodeId: string }; to: { nodeId: string } }> }
+  nodeRuns: Array<{ nodeId: string; output?: { fields?: Record<string, unknown> } }>
+}
+
+export interface WorkflowRunSummary {
+  id: string
+  workflowId: string
+  status: string
+  trigger: { nodeId: string; kind: string }
+  startedAt: string
+  endedAt: string | null
+  currentOrFailingNode: { nodeId: string; label: string; state: "current" | "failing" } | null
+}
+
+export interface AutomationTemplateVariable {
+  key: string
+  label: string
+  hint: string
+  required: boolean
+  default?: string
+  options?: string[]
+}
+
+export interface AutomationTemplateSpec {
+  id: string
+  name: string
+  when: string
+  flow: string
+  variables: AutomationTemplateVariable[]
+}
+
 export interface TranscriptContentBlock {
   type: 'text' | 'tool_use' | 'tool_result' | 'thinking'
   text?: string
@@ -228,6 +292,31 @@ export const api = {
     post<{ status: string; sessionId: string }>(`/api/sessions/${id}/stop`, {}),
   resetSession: (id: string) =>
     post<{ status: string; sessionId: string }>(`/api/sessions/${id}/reset`, {}),
+  // --- Workflows (automation hub) ---
+  getWorkflows: (cursor?: string) =>
+    get<{ items: WorkflowSummary[]; nextCursor: string | null }>(
+      cursor ? `/api/workflows?cursor=${encodeURIComponent(cursor)}` : "/api/workflows"),
+  getWorkflow: (id: string) => get<WorkflowDefinitionDetail>(`/api/workflows/${encodeURIComponent(id)}`),
+  setWorkflowEnabled: (id: string, enabled: boolean, expectedRevision: number) =>
+    post<WorkflowSummary>(`/api/workflows/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, { expectedRevision }),
+  startWorkflowRun: (id: string) =>
+    post<{ id: string; status: string }>(`/api/workflows/${encodeURIComponent(id)}/runs`, { input: {} }),
+  getWorkflowRuns: (id: string) =>
+    get<{ items: WorkflowRunSummary[] }>(`/api/workflows/${encodeURIComponent(id)}/runs`),
+  getWorkflowRun: (id: string, runId: string) =>
+    get<WorkflowRunDetailForApproval>(
+      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}?view=full`),
+  // Who decided is stamped by the gateway from the request itself (a browser
+  // call carries no caller-session header → operator), so the body carries
+  // only the decision.
+  decideWorkflowApproval: (id: string, runId: string, nodeId: string, decision: "approve" | "reject", expectedRevision: number) =>
+    post<{ status: string }>(
+      `/api/workflows/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/approval`,
+      { decision, expectedRevision }),
+  getAutomationTemplates: () =>
+    get<{ templates: AutomationTemplateSpec[]; workflowsEnabled: boolean }>("/api/automation/templates"),
+  createWorkflowFromTemplate: (templateId: string, data: { name: string; title?: string; vars: Record<string, string>; enable?: boolean }) =>
+    post<{ id: string; revision: number; enabled: boolean }>(`/api/automation/templates/${encodeURIComponent(templateId)}`, data),
   getCronJobs: () => get<Record<string, unknown>[]>("/api/cron"),
   createCronJob: (data: Record<string, unknown>) =>
     post<Record<string, unknown>>("/api/cron", data),

@@ -65,6 +65,107 @@ program
     await runPair(opts);
   });
 
+{
+  const automationCmd = program
+    .command("automation")
+    .description("自動化（cron + workflow）の統合操作");
+  automationCmd
+    .command("list")
+    .description("cron と workflow をまとめて一覧する")
+    .option("--json", "JSON形式で出力（AIエージェント向け）")
+    .action(async (opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runAutomationList(opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  automationCmd
+    .command("enable <id>")
+    .description("自動化を有効にする（cron / workflow どちらでも）")
+    .option("--kind <kind>", "cron / workflow（同名IDが両方にある時に指定）")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, opts: { json?: boolean; kind?: string }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runAutomationToggle(id, true, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  automationCmd
+    .command("disable <id>")
+    .description("自動化を無効にする（cron / workflow どちらでも）")
+    .option("--kind <kind>", "cron / workflow（同名IDが両方にある時に指定）")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, opts: { json?: boolean; kind?: string }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runAutomationToggle(id, false, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+
+  const workflowCmd = program
+    .command("workflow")
+    .description("workflow の作成・実行・履歴（テンプレ一覧: ryoko workflow templates）");
+  workflowCmd
+    .command("templates")
+    .description("テンプレート一覧と変数（--set で渡すキー）を表示する")
+    .option("--json", "JSON形式で出力")
+    .action(async (opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowTemplates(opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("list")
+    .description("workflow の一覧")
+    .option("--json", "JSON形式で出力")
+    .action(async (opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowList(opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("create")
+    .description("テンプレートまたは JSON 定義から workflow を作る")
+    .option("--template <id>", "テンプレートID（ryoko workflow templates で一覧）")
+    .option("--file <path>", "JSON 定義ファイル（nodes/edges を含む）")
+    .requiredOption("--name <id>", "workflow の ID（英数とハイフン）")
+    .option("--title <title>", "表示タイトル（省略時は ID）")
+    .option("--set <key=value...>", "テンプレート変数", (v: string, acc: string[]) => [...acc, v], [] as string[])
+    .option("--enable", "作成後すぐ有効化する")
+    .option("--json", "JSON形式で出力")
+    .action(async (opts: { template?: string; file?: string; name: string; title?: string; set: string[]; enable?: boolean; json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowCreate(opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("show <id>")
+    .description("workflow の定義と状態を表示する")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowShow(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("run <id>")
+    .description("workflow を今すぐ実行する")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowStart(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("approve <id> <runId>")
+    .description("承認待ちの run を承認する（--reject で却下）")
+    .option("--node <nodeId>", "承認ノードID（承認待ちが複数ある時に指定）")
+    .option("--reject", "却下する")
+    .option("--note <note>", "決定のメモ")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, runId: string, opts: { json?: boolean; node?: string; reject?: boolean; note?: string }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowApprove(id, runId, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+  workflowCmd
+    .command("runs <id>")
+    .description("workflow の実行履歴を表示する")
+    .option("--json", "JSON形式で出力")
+    .action(async (id: string, opts: { json?: boolean }) => {
+      const cli = await import("../src/cli/automation.js");
+      await cli.runWorkflowRuns(id, opts).catch((e) => cli.reportCliFailure(e, opts.json));
+    });
+}
+
 program
   .command("api <method> <path>")
   .description("認証付きでこのインスタンスのGateway APIを呼び出す")

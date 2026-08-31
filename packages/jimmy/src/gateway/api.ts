@@ -137,6 +137,12 @@ export interface ApiContext {
   authHome?: string;
   /** Present only when config.workflows.enabled — carries the Workflow engine. */
   workflowService?: WorkflowService;
+  /** The workflow store's own connection — atomic create wraps the repository
+   *  writes in one transaction on it. Present alongside workflowService. */
+  workflowDatabase?: import("better-sqlite3").Database;
+  /** The workflow repository on that connection (atomic create writes through
+   *  it so no service-side notifications fire mid-transaction). */
+  workflowRepository?: import("../workflows/repository.js").WorkflowRepository;
 }
 
 export function resumePendingWebQueueItems(context: ApiContext): void {
@@ -489,6 +495,112 @@ export async function handleApiRequest(
           && workflowVerifyAuth(req.headers, context.authToken, context.authHome));
       if (await handleWorkflowApi(req, res, { method, pathname, url },
         { service: context.workflowService, authenticated })) return;
+    }
+
+    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
+    // Lives outside /api/workflows so a definition id can never shadow it.
+    if (method === "GET" && pathname === "/api/automation/templates") {
+      const { AUTOMATION_TEMPLATES } = await import("../workflows/templates.js");
+      return json(res, { templates: AUTOMATION_TEMPLATES, workflowsEnabled: Boolean(context.workflowService) });
+    }
+
+    // POST /api/automation/templates/:id  — build from a template
+    // POST /api/automation/definitions    — raw nodes/edges (agents, --file)
+    // Both validate the FULL definition (schema + executability) up front and
+    // then create+save+enable in ONE transaction (atomic-create.ts), so no
+    // failure can leave a skeleton definition behind.
+    {
+      const templateParams = matchRoute("/api/automation/templates/:id", pathname);
+      const isRawCreate = pathname === "/api/automation/definitions";
+      if (method === "POST" && (templateParams || isRawCreate)) {
+        if (!context.workflowService || !context.workflowDatabase || !context.workflowRepository) {
+          return json(res, { error: "Workflow エンジンが無効です。config.workflows.enabled: true にして再起動してください。" }, 404);
+        }
+        const { isJsonMediaType } = await import("./media-type.js");
+        if (!isJsonMediaType(req.headers["content-type"])) {
+          return json(res, { error: "Content-Type must be application/json" }, 415);
+        }
+        const { readJsonBody } = await import("./http-helpers.js");
+        const read = await readJsonBody(req, res, { maxBytes: 256 * 1024, rejectDuplicateTopLevelKeys: true });
+        if (!read.ok) return; // readJsonBody already responded (bad JSON / dup keys / too large)
+        const parsed = read.body;
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return badRequest(res, "Request body must be a JSON object");
+        }
+        const known = new Set(isRawCreate
+          ? ["name", "title", "description", "nodes", "edges", "enable"]
+          : ["name", "title", "vars", "enable"]);
+        const unknown = Object.keys(parsed).filter((key) => !known.has(key));
+        if (unknown.length > 0) return badRequest(res, `Unknown field(s): ${unknown.join(", ")}`);
+        const { name, title, vars, enable, description, nodes, edges } = parsed as {
+          name?: unknown; title?: unknown; vars?: unknown; enable?: unknown;
+          description?: unknown; nodes?: unknown; edges?: unknown;
+        };
+        if (typeof name !== "string" || !name.trim()) {
+          return badRequest(res, "name is required (workflow id, alphanumeric + hyphen)");
+        }
+        if (title !== undefined && typeof title !== "string") return badRequest(res, "title must be a string");
+        if (enable !== undefined && typeof enable !== "boolean") return badRequest(res, "enable must be a boolean");
+
+        const { TemplateError } = await import("../workflows/templates.js");
+        const { workflowDefinitionSchema } = await import("../workflows/model.js");
+        const { validateExecutableWorkflow } = await import("../workflows/validation.js");
+        const { WorkflowRepositoryError } = await import("../workflows/repository-support.js");
+        const { createWorkflowAtomically } = await import("./workflow-atomic-create.js");
+        try {
+          let builtDescription: string | undefined;
+          let builtNodes: unknown;
+          let builtEdges: unknown;
+          if (templateParams) {
+            if (vars !== undefined && (typeof vars !== "object" || vars === null || Array.isArray(vars)
+              || Object.values(vars).some((value) => typeof value !== "string"))) {
+              return badRequest(res, "vars must be an object of string values");
+            }
+            const { buildTemplateBody } = await import("../workflows/templates.js");
+            const built = buildTemplateBody(templateParams.id, (vars ?? {}) as Record<string, string>);
+            builtDescription = built.description;
+            builtNodes = built.nodes;
+            builtEdges = built.edges;
+          } else {
+            if (description !== undefined && typeof description !== "string") return badRequest(res, "description must be a string");
+            if (!Array.isArray(nodes) || !Array.isArray(edges)) return badRequest(res, "nodes and edges are required arrays");
+            builtDescription = description as string | undefined;
+            builtNodes = nodes;
+            builtEdges = edges;
+          }
+          // Pre-validate the complete definition the save would produce.
+          const now = new Date().toISOString();
+          const candidate = workflowDefinitionSchema.safeParse({
+            schemaVersion: 1, id: name, title: title ?? name,
+            ...(builtDescription ? { description: builtDescription } : {}),
+            revision: 1, enabled: false, createdAt: now, updatedAt: now,
+            nodes: builtNodes, edges: builtEdges,
+          });
+          if (!candidate.success) {
+            return json(res, { error: "Workflow definition is invalid.", issues: candidate.error.issues }, 422);
+          }
+          const executable = validateExecutableWorkflow(candidate.data);
+          if (!executable.ok) {
+            return json(res, { error: "Workflow definition is not executable.", issues: executable.issues }, 422);
+          }
+          const result = createWorkflowAtomically(context.workflowDatabase, context.workflowRepository, context.workflowService, {
+            id: name, title: (title as string | undefined) ?? name,
+            ...(builtDescription ? { description: builtDescription } : {}),
+            nodes: candidate.data.nodes, edges: candidate.data.edges,
+            enable: enable === true,
+          });
+          return json(res, result, 201);
+        } catch (error) {
+          if (error instanceof TemplateError) return json(res, { error: error.message }, 422);
+          if (error instanceof WorkflowRepositoryError) {
+            const status = error.code === "id-conflict" || error.code === "revision-conflict" ? 409
+              : error.code === "not-found" ? 404 : 422;
+            return json(res, { error: error.message, code: error.code }, status);
+          }
+          console.error(`[automation] create failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+          return serverError(res, "Workflow create failed");
+        }
+      }
     }
 
     // POST /api/internal/hook — receive Claude Code turn hooks from hook-relay.mjs

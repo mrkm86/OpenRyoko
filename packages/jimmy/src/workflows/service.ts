@@ -150,6 +150,13 @@ export class WorkflowService {
     this.triggers.rebuild();
     this.options.onDefinitionChange?.({ workflowId: definition.id, revision: definition.revision });
   }
+  /** Fork addition (OpenRyoko): after an out-of-band repository write — the
+   *  atomic create in gateway/workflow-atomic-create.ts — re-arm triggers and
+   *  notify exactly once, AFTER the transaction committed. */
+  definitionWritten(id: string): void {
+    const definition = this.options.repository.getDefinition(id);
+    if (definition) this.definitionChanged(definition);
+  }
   private runChanged(run: WorkflowRunDetail): void {
     this.options.onChange?.({ workflowId: run.workflowId, runId: run.id });
     this.wakeCaller(run);
