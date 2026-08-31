@@ -12,10 +12,10 @@ import { handleApiRequest, type ApiContext } from "../api.js";
  * bad tokens are refused before any write, and a connector that fails to
  * start after a write gets the previous Slack block put back. */
 
-function fakePost(pathname: string, body: unknown): IncomingMessage {
+function fakePost(pathname: string, body: unknown, method = "POST"): IncomingMessage {
   const readable = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage;
   readable.headers = { host: "127.0.0.1", "content-type": "application/json" };
-  readable.method = "POST";
+  readable.method = method;
   readable.url = pathname;
   return readable;
 }
@@ -100,10 +100,92 @@ describe("POST /api/onboarding/slack/connect", () => {
       .mockResolvedValueOnce({ started: [], stopped: ["slack"], errors: ["slack: An API error occurred: invalid_auth"] })
       .mockResolvedValueOnce({ started: ["slack"], stopped: [], errors: [] });
     const outcome = await connect(contextWith(reload));
-    expect(outcome).toMatchObject({ ok: false, stage: "reload", rolledBack: true });
+    expect(outcome).toMatchObject({ ok: false, stage: "reload", rolledBack: true, restored: { disk: true, running: true } });
     expect(String(outcome.error)).toContain("invalid_auth");
     expect(reload).toHaveBeenCalledTimes(2); // the failed start, then the rollback reload
     expect(readConfig().connectors?.slack).toEqual(PREVIOUS);
+  });
+
+  it("does not call a rollback successful when the previous connector fails to come back", async () => {
+    stubSlack(true);
+    const reload = vi.fn()
+      .mockResolvedValueOnce({ started: [], stopped: ["slack"], errors: ["slack: invalid_auth"] })
+      .mockResolvedValueOnce({ started: [], stopped: [], errors: ["slack: connect ETIMEDOUT"] }); // rollback reload also fails
+    const outcome = await connect(contextWith(reload));
+    expect(outcome).toMatchObject({ ok: false, stage: "reload", rolledBack: false, restored: { disk: true, running: false } });
+    expect(String(outcome.rollbackError)).toContain("ETIMEDOUT");
+    expect(readConfig().connectors?.slack).toEqual(PREVIOUS); // the file IS restored, and the result says so precisely
+  });
+
+  it("leaves a Slack block that someone else wrote meanwhile alone instead of rolling over it", async () => {
+    stubSlack(true);
+    const THEIRS = { botToken: "xoxb-THEIRS", appToken: "xapp-THEIRS" };
+    const reload = vi.fn().mockImplementationOnce(async () => {
+      // An out-of-band editor (vim, the CLI) rewrites the block while our
+      // connector reload is in flight — the lock only covers API writers.
+      fs.writeFileSync(CONFIG_PATH, yaml.dump({ engines: { default: "claude" }, connectors: { slack: THEIRS } }));
+      return { started: [], stopped: [], errors: ["slack: invalid_auth"] };
+    });
+    const outcome = await connect(contextWith(reload));
+    expect(outcome).toMatchObject({ ok: false, rolledBack: false, restored: { disk: false, running: false } });
+    expect(String(outcome.rollbackSkipped)).toContain("concurrently");
+    expect(reload).toHaveBeenCalledTimes(1); // no rollback write, no second reload
+    expect(readConfig().connectors?.slack).toEqual(THEIRS);
+  });
+
+  it("serializes concurrent connects: the second one's reload starts only after the first fully settles", async () => {
+    stubSlack(true);
+    let inFlight = 0;
+    let overlapped = false;
+    const reload = vi.fn(async () => {
+      inFlight += 1;
+      if (inFlight > 1) overlapped = true;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inFlight -= 1;
+      return { started: ["slack"], stopped: [], errors: [] };
+    });
+    const context = contextWith(reload);
+    const [first, second] = await Promise.all([
+      connect(context, "xoxb-ONE", "xapp-ONE"),
+      connect(context, "xoxb-TWO", "xapp-TWO"),
+    ]);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(overlapped).toBe(false);
+    expect(readConfig().connectors?.slack).toMatchObject({ botToken: "xoxb-TWO", appToken: "xapp-TWO" }); // last writer, in order
+  });
+
+  it("makes PUT /api/config wait for an in-flight connect (and never lose its write to the rollback)", async () => {
+    stubSlack(true);
+    let releaseReload!: () => void;
+    const reloadGate = new Promise<void>((resolve) => { releaseReload = resolve; });
+    let markReloadStarted!: () => void;
+    const reloadStarted = new Promise<void>((resolve) => { markReloadStarted = resolve; });
+    const reload = vi.fn()
+      .mockImplementationOnce(async () => { markReloadStarted(); await reloadGate; return { started: [], stopped: [], errors: ["slack: invalid_auth"] }; })
+      .mockResolvedValue({ started: ["slack"], stopped: [], errors: [] });
+    const context = contextWith(reload);
+
+    const connecting = connect(context, "xoxb-NEW", "xapp-NEW");
+    // connect verifies with Slack BEFORE taking the lock; wait until it is
+    // inside its critical section (first reload started) and THEN let a
+    // settings-page save come in — that is the interleaving under test.
+    await reloadStarted;
+    let putDone = false;
+    const putting = (async () => {
+      const { res } = fakeResponse();
+      await handleApiRequest(fakePost("/api/config", { portal: { portalName: "Ryoko2" } }, "PUT"), res, context);
+      putDone = true;
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(putDone).toBe(false); // blocked behind connect's critical section
+    releaseReload();
+    const outcome = await connecting;
+    await putting;
+    expect(outcome).toMatchObject({ rolledBack: true });
+    const cfg = yaml.load(fs.readFileSync(CONFIG_PATH, "utf-8")) as { portal?: { portalName?: string }; connectors?: { slack?: unknown } };
+    expect(cfg.portal?.portalName).toBe("Ryoko2"); // the PUT landed AFTER the rollback and survived it
+    expect(cfg.connectors?.slack).toEqual(PREVIOUS);
   });
 
   it("treats a reload that throws as a failure and rolls back too", async () => {

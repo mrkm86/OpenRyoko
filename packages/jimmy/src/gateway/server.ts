@@ -873,26 +873,32 @@ export async function startGateway(
   let reloadInFlight: Promise<{ started: string[]; stopped: string[]; errors: string[] }> | null = null;
   let pendingReload = false;
 
-  // Coordination flag between the API config-save path and the file watcher.
-  // PUT /api/config eagerly reloads connectors for snappy UX, then sets this
-  // flag so the chokidar event for the same file write doesn't double-reload
-  // and race against the in-flight reload.
-  let suppressNextWatcherConnectorReload = false;
+  // Coordination between the API config-write paths and the file watcher.
+  // A writer that reloads connectors itself (PUT /api/config, the onboarding
+  // Slack connect and its rollback) arms one suppression per file write, and
+  // the watcher consumes one per event it skips. A COUNTER rather than a flag,
+  // so two writers in flight cannot clear each other's suppression: each
+  // arms and clears only its own. A safety timer drains everything in case a
+  // watcher event never arrives (chokidar coalesced two writes into one
+  // event, or missed it), so legitimate external edits are never suppressed
+  // for long. Known limit: when chokidar coalesces N writes into one event,
+  // N-1 suppressions remain until the timer drains them.
+  let suppressedWatcherConnectorReloads = 0;
   let suppressTimer: ReturnType<typeof setTimeout> | null = null;
-  function suppressNextConnectorReload(): void {
-    suppressNextWatcherConnectorReload = true;
+  function armSuppressDrainTimer(): void {
     if (suppressTimer) clearTimeout(suppressTimer);
-    // Auto-clear after 3s in case the watcher event never arrives (the file
-    // write was rolled back, chokidar missed it, etc.) — we don't want to
-    // permanently suppress legitimate future reloads.
     suppressTimer = setTimeout(() => {
-      suppressNextWatcherConnectorReload = false;
+      suppressedWatcherConnectorReloads = 0;
       suppressTimer = null;
     }, 3000);
   }
+  function suppressNextConnectorReload(): void {
+    suppressedWatcherConnectorReloads += 1;
+    armSuppressDrainTimer();
+  }
   function clearSuppressNextConnectorReload(): void {
-    suppressNextWatcherConnectorReload = false;
-    if (suppressTimer) {
+    if (suppressedWatcherConnectorReloads > 0) suppressedWatcherConnectorReloads -= 1;
+    if (suppressedWatcherConnectorReloads === 0 && suppressTimer) {
       clearTimeout(suppressTimer);
       suppressTimer = null;
     }
@@ -1169,13 +1175,13 @@ export async function startGateway(
         // triggered reloadAllConnectors itself and may still be mid-reconnect.
         // Skip our reload to avoid stop→start→stop→start churn and the
         // race that comes with two overlapping reloads.
-        if (suppressNextWatcherConnectorReload) {
-          suppressNextWatcherConnectorReload = false;
-          if (suppressTimer) {
+        if (suppressedWatcherConnectorReloads > 0) {
+          suppressedWatcherConnectorReloads -= 1;
+          if (suppressedWatcherConnectorReloads === 0 && suppressTimer) {
             clearTimeout(suppressTimer);
             suppressTimer = null;
           }
-          logger.debug("Skipping watcher-triggered connector reload (API just wrote config and reloaded)");
+          logger.debug("Skipping watcher-triggered connector reload (an API write just reloaded connectors itself)");
           return;
         }
 

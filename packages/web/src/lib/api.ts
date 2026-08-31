@@ -19,7 +19,11 @@ export interface SlackConnectResult {
   ok: boolean
   stage?: "verify" | "reload"
   error?: string
+  /** True only when the previous Slack block is back on disk AND running. */
   rolledBack?: boolean
+  restored?: { disk: boolean; running: boolean }
+  rollbackError?: string
+  rollbackSkipped?: string
   team?: string
   user?: string
   bot?: SlackVerifyResult["bot"]

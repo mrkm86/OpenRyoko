@@ -173,6 +173,18 @@ function describeSlackError(code: string | undefined): string {
   }
 }
 
+/** A save that Slack accepted but the connector could not start — and what
+ *  state the install was left in, stated honestly rather than optimistically. */
+function describeReloadFailure(outcome: { error?: string; rolledBack?: boolean; restored?: { disk: boolean; running: boolean }; rollbackError?: string; rollbackSkipped?: string }): string {
+  const head = `トークンは正しいのに接続の起動に失敗しました: ${outcome.error ?? "不明なエラー"}。`
+  if (outcome.rolledBack) return `${head}以前の Slack 設定に戻し、再接続しました。`
+  if (outcome.rollbackSkipped) return `${head}その間に設定が別の場所から変更されたため、元に戻す操作は行っていません。設定ページで現在の Slack 設定を確認してください。`
+  if (outcome.restored?.disk && !outcome.restored.running) {
+    return `${head}以前の設定はファイルに戻しましたが、その接続も起動できていません（${outcome.rollbackError ?? "原因不明"}）。設定ページで確認してください。`
+  }
+  return `${head}以前の設定に戻せませんでした（${outcome.rollbackError ?? "原因不明"}）。設定ページで Slack 設定を確認してください。`
+}
+
 function SlackStep() {
   const [botToken, setBotToken] = useState("")
   const [appToken, setAppToken] = useState("")
@@ -216,10 +228,7 @@ function SlackStep() {
         setResult({ ok: false, message: `保存していません。${parts.join(" / ") || "トークンを確認できませんでした"}` })
         return
       }
-      setResult({
-        ok: false,
-        message: `トークンは正しいのに接続の起動に失敗しました: ${outcome.error ?? "不明なエラー"}${outcome.rolledBack ? "（以前の Slack 設定に戻しました）" : ""}`,
-      })
+      setResult({ ok: false, message: describeReloadFailure(outcome) })
     } catch (err) {
       setResult({ ok: false, message: `接続処理でエラーが起きました: ${err instanceof Error ? err.message : String(err)}` })
     } finally {
