@@ -277,13 +277,25 @@ function TemplateForm({
   )
 }
 
-function CreatePanel({ onCreated, onClose }: { onCreated: () => void; onClose: () => void }) {
+function CreatePanel({ onCreated, onClose, initialTemplateId }: {
+  onCreated: () => void
+  onClose: () => void
+  initialTemplateId?: string | null
+}) {
   const [templates, setTemplates] = useState<AutomationTemplateSpec[] | null>(null)
   const [selected, setSelected] = useState<AutomationTemplateSpec | null>(null)
 
   useEffect(() => {
-    api.getAutomationTemplates().then((result) => setTemplates(result.templates)).catch(() => setTemplates([]))
-  }, [])
+    api.getAutomationTemplates()
+      .then((result) => {
+        setTemplates(result.templates)
+        if (initialTemplateId) {
+          const preset = result.templates.find((template) => template.id === initialTemplateId)
+          if (preset) setSelected(preset)
+        }
+      })
+      .catch(() => setTemplates([]))
+  }, [initialTemplateId])
 
   return (
     <div className="rounded-[var(--radius-md)] border border-[var(--separator)] bg-[var(--material-regular)] p-[var(--space-4)] mb-[var(--space-3)]">
@@ -346,8 +358,9 @@ async function fetchAllWorkflows(): Promise<WorkflowSummary[]> {
   return items
 }
 
-export function WorkflowsSection({ creating, onCloseCreate, filter, onCountsChange }: {
+export function WorkflowsSection({ creating, initialTemplateId, onCloseCreate, filter, onCountsChange }: {
   creating: boolean
+  initialTemplateId?: string | null
   onCloseCreate: () => void
   filter: "all" | "enabled" | "disabled"
   onCountsChange?: (counts: WorkflowCounts) => void
@@ -440,7 +453,7 @@ export function WorkflowsSection({ creating, onCloseCreate, filter, onCountsChan
 
   return (
     <div className="mb-[var(--space-4)]">
-      {creating && <CreatePanel onCreated={() => { onCloseCreate(); refresh() }} onClose={onCloseCreate} />}
+      {creating && <CreatePanel initialTemplateId={initialTemplateId} onCreated={() => { onCloseCreate(); refresh() }} onClose={onCloseCreate} />}
       {notice && (
         <div className="text-[length:var(--text-caption1)] text-[var(--text-secondary)] mb-[var(--space-2)]">{notice}</div>
       )}

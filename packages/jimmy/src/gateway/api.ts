@@ -2,6 +2,7 @@ import type { IncomingMessage as HttpRequest, ServerResponse } from "node:http";
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
 import cron from "node-cron";
@@ -497,7 +498,57 @@ export async function handleApiRequest(
         { service: context.workflowService, authenticated })) return;
     }
 
-    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
+    // GET /api/onboarding/engines — is each configured engine INSTALLED and
+    // STARTABLE, and what login state can be observed locally? This is an
+    // install check with the best available auth signal — the wizard words it
+    // that way. It never spends tokens or reaches the network. One probe runs
+    // at a time (shared in-flight promise) and the result is cached briefly,
+    // so a burst of requests spawns one set of child processes, not many.
+    if (method === "GET" && pathname === "/api/onboarding/engines") {
+      const config = context.getConfig();
+      res.setHeader("Cache-Control", "no-store");
+      return json(res, await probeOnboardingEngines(config));
+    }
+
+    // POST /api/onboarding/slack/connect — the whole Slack hookup as ONE
+    // server-side operation: verify both tokens, save, reload, and if the
+    // connector still fails to start, put the previous Slack config back and
+    // reload again. The wizard calls only this, so "a wrong token never
+    // overwrites a working connection" holds across the verify→save gap too.
+    if (method === "POST" && pathname === "/api/onboarding/slack/connect") {
+      const { readJsonBody } = await import("./http-helpers.js");
+      const read = await readJsonBody(req, res, { maxBytes: 16 * 1024 });
+      if (!read.ok) return;
+      const body = read.body as { botToken?: unknown; appToken?: unknown } | null;
+      const botToken = typeof body?.botToken === "string" ? body.botToken.trim() : "";
+      const appToken = typeof body?.appToken === "string" ? body.appToken.trim() : "";
+      if (!botToken.startsWith("xoxb-") || !appToken.startsWith("xapp-")) {
+        return badRequest(res, "botToken must start with xoxb- and appToken with xapp-");
+      }
+      res.setHeader("Cache-Control", "no-store");
+      return json(res, await connectSlack(context, botToken, appToken));
+    }
+
+    // POST /api/onboarding/slack/verify — prove BOTH Slack tokens before
+    // anything is saved: auth.test for the bot token, apps.connections.open
+    // for the app token (Socket Mode). Nothing is written here; the wizard
+    // saves only after both answer ok, so a wrong token can never overwrite a
+    // working connection.
+    if (method === "POST" && pathname === "/api/onboarding/slack/verify") {
+      const { readJsonBody } = await import("./http-helpers.js");
+      const read = await readJsonBody(req, res, { maxBytes: 16 * 1024 });
+      if (!read.ok) return;
+      const body = read.body as { botToken?: unknown; appToken?: unknown } | null;
+      const botToken = typeof body?.botToken === "string" ? body.botToken.trim() : "";
+      const appToken = typeof body?.appToken === "string" ? body.appToken.trim() : "";
+      if (!botToken.startsWith("xoxb-") || !appToken.startsWith("xapp-")) {
+        return badRequest(res, "botToken must start with xoxb- and appToken with xapp-");
+      }
+      res.setHeader("Cache-Control", "no-store");
+      return json(res, await verifySlackTokens(botToken, appToken));
+    }
+
+    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.    // GET /api/automation/templates — the fill-in-the-blanks workflow shapes.
     // Lives outside /api/workflows so a definition id can never shadow it.
     if (method === "GET" && pathname === "/api/automation/templates") {
       const { AUTOMATION_TEMPLATES } = await import("../workflows/templates.js");
@@ -1839,6 +1890,10 @@ Handle this as a priority request from a colleague.`;
       if (body.engines !== undefined && (typeof body.engines !== "object" || Array.isArray(body.engines))) {
         return badRequest(res, "engines must be an object");
       }
+      // Every read→merge→write→reload of config.yaml runs under one lock, so a
+      // concurrent writer (another PUT, the onboarding Slack connect and its
+      // rollback) can never interleave with — or be overwritten by — this one.
+      return withConfigLock(async () => {
       // Deep-merge incoming config with existing config to preserve
       // fields not included in the update (e.g. connector tokens).
       let existing: Record<string, unknown> = {};
@@ -1878,6 +1933,7 @@ Handle this as a priority request from a colleague.`;
 
       fs.writeFileSync(CONFIG_PATH, yamlStr);
       invalidateModelRegistry(); // models/engines may have changed — rebuild on next read
+      _resetEngineProbeCache(); // engine bins may have changed — the onboarding probe must re-run
       logger.info("Config updated via API");
 
       if (connectorsChanged && context.reloadAllConnectors) {
@@ -1922,6 +1978,7 @@ Handle this as a priority request from a colleague.`;
       }
 
       return json(res, { status: "ok" });
+      });
     }
 
     // GET /api/logs
@@ -3183,4 +3240,301 @@ async function runWebSession(
     });
     logger.error(`Web session ${currentSession.id} error: ${errMsg}`);
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// Config write serialization (fork addition)
+// ---------------------------------------------------------------------------
+
+/** One writer at a time for config.yaml + connector reload. The chain never
+ *  rejects: a failing writer settles its own promise and the next waiter runs. */
+let configWriteChain: Promise<void> = Promise.resolve();
+export function withConfigLock<T>(work: () => Promise<T>): Promise<T> {
+  const run = configWriteChain.then(work, work);
+  configWriteChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding probes (fork addition)
+// ---------------------------------------------------------------------------
+
+interface EngineProbeResult {
+  name: string;
+  configured: boolean;
+  installed: boolean;
+  runnable: boolean;
+  bin?: string;
+  version?: string;
+  error?: string;
+  auth?: { method: "api-key" | "oauth" | "chatgpt" | "none" | "unknown"; expiresAt?: string; expired?: boolean; note: string };
+}
+
+const ENGINE_PROBE_TTL_MS = 10_000;
+type EngineProbePayload = { default: string; probedAt: string; engines: EngineProbeResult[] };
+/** Cache and in-flight probe are keyed by the engine config they were taken
+ *  under, so a bin/default change is never answered from a stale result — and
+ *  a probe started under the old config only ever caches under the old key. */
+let engineProbeInFlight: { key: string; promise: Promise<EngineProbePayload> } | null = null;
+let engineProbeCache: { key: string; at: number; value: EngineProbePayload } | null = null;
+
+function engineProbeKey(config: JinnConfig): string {
+  return JSON.stringify({
+    default: config.engines.default,
+    claude: config.engines.claude?.bin, codex: config.engines.codex?.bin, gemini: config.engines.gemini?.bin,
+  });
+}
+
+function runBinary(bin: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    import("node:child_process").then(({ execFile }) => {
+      execFile(bin, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ ok: !err, stdout: String(stdout ?? ""), stderr: String(stderr ?? err?.message ?? "") });
+      });
+    });
+  });
+}
+
+async function probeEngine(name: string, bin: string | undefined): Promise<EngineProbeResult> {
+  if (!bin) return { name, configured: false, installed: false, runnable: false };
+  const { tryResolveBin } = await import("../shared/resolveBin.js");
+  const resolved = tryResolveBin(bin);
+  if (!resolved) return { name, configured: true, installed: false, runnable: false, bin, error: `${bin} が PATH にありません` };
+  const version = await runBinary(resolved, ["--version"], 8_000);
+  if (!version.ok) {
+    return { name, configured: true, installed: true, runnable: false, bin: resolved,
+      error: version.stderr.trim().split("\n")[0] || "起動に失敗しました" };
+  }
+  return { name, configured: true, installed: true, runnable: true, bin: resolved, version: version.stdout.trim().split("\n")[0] };
+}
+
+/** What can be observed about Claude's login WITHOUT spending anything: an API
+ *  key in the environment, or the subscription OAuth file's expiry. Neither
+ *  proves the credential still works — the note says so. */
+function observeClaudeAuth(): NonNullable<EngineProbeResult["auth"]> {
+  if (process.env.ANTHROPIC_API_KEY) return { method: "api-key", note: "API キーが設定されています（有効性は初回実行時に判明）" };
+  try {
+    const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+    const raw = fs.readFileSync(path.join(dir, ".credentials.json"), "utf-8");
+    const expiresAt = JSON.parse(raw)?.claudeAiOauth?.expiresAt;
+    if (typeof expiresAt === "number" && expiresAt > 0) {
+      const expired = expiresAt < Date.now();
+      return { method: "oauth", expiresAt: new Date(expiresAt).toISOString(), expired,
+        note: expired ? "ログインの期限が切れています（claude を一度起動すると更新されます）" : "ログイン情報があります（有効性は初回実行時に判明）" };
+    }
+    return { method: "unknown", note: "ログイン情報の形式を判定できませんでした" };
+  } catch {
+    return { method: "none", note: "ログイン情報が見つかりません（端末で claude と入力してログイン）" };
+  }
+}
+
+/** `codex login status` answers with its exit code — the one engine that can
+ *  be asked directly, still without spending anything. */
+async function observeCodexAuth(resolvedBin: string): Promise<NonNullable<EngineProbeResult["auth"]>> {
+  const status = await runBinary(resolvedBin, ["login", "status"], 8_000);
+  if (status.ok) return { method: "chatgpt", note: (status.stdout.trim().split("\n")[0] || "ログイン済み") };
+  return { method: "none", note: "未ログインです（端末で codex login を実行）" };
+}
+
+async function probeOnboardingEngines(config: JinnConfig): Promise<EngineProbePayload> {
+  const key = engineProbeKey(config);
+  if (engineProbeCache && engineProbeCache.key === key && Date.now() - engineProbeCache.at < ENGINE_PROBE_TTL_MS) {
+    return engineProbeCache.value;
+  }
+  if (engineProbeInFlight && engineProbeInFlight.key === key) return engineProbeInFlight.promise;
+  const promise = (async () => {
+    const [claude, codex, gemini] = await Promise.all([
+      probeEngine("claude", config.engines.claude?.bin),
+      probeEngine("codex", config.engines.codex?.bin),
+      probeEngine("gemini", config.engines.gemini?.bin),
+    ]);
+    if (claude.runnable) claude.auth = observeClaudeAuth();
+    if (codex.runnable && codex.bin) codex.auth = await observeCodexAuth(codex.bin);
+    const value: EngineProbePayload = {
+      default: config.engines.default, probedAt: new Date().toISOString(),
+      engines: [claude, codex, ...(gemini.configured ? [gemini] : [])],
+    };
+    // Only the newest config's probe may become "the" cache; a probe that ran
+    // under a config since replaced must not resurrect a stale answer.
+    if (!engineProbeCache || engineProbeCache.key === key || engineProbeInFlight?.key === key) {
+      engineProbeCache = { key, at: Date.now(), value };
+    }
+    return value;
+  })();
+  engineProbeInFlight = { key, promise };
+  promise.finally(() => { if (engineProbeInFlight?.promise === promise) engineProbeInFlight = null; });
+  return promise;
+}
+
+/** Exposed for tests: forget the cached probe. */
+export function _resetEngineProbeCache(): void {
+  engineProbeCache = null;
+  engineProbeInFlight = null;
+}
+
+interface SlackVerifyResult {
+  ok: boolean;
+  bot: { ok: boolean; team?: string; user?: string; error?: string };
+  app: { ok: boolean; error?: string };
+}
+
+async function slackApi(method: string, token: string): Promise<{ ok: boolean; error?: string; [key: string]: unknown }> {
+  try {
+    const response = await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/x-www-form-urlencoded" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      logger.warn(`[onboarding] Slack ${method} answered HTTP ${response.status}`);
+      return { ok: false, error: `http_${response.status}` };
+    }
+    const payload = await response.json() as { ok?: boolean; error?: string; [key: string]: unknown };
+    return { ...payload, ok: payload.ok === true };
+  } catch (err) {
+    // The raw message (DNS, TLS, timeout details) goes to the log; the client
+    // gets a stable, non-leaky code.
+    logger.warn(`[onboarding] Slack ${method} request failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, error: "network_error" };
+  }
+}
+
+async function verifySlackTokens(botToken: string, appToken: string): Promise<SlackVerifyResult> {
+  const [bot, app] = await Promise.all([
+    slackApi("auth.test", botToken),
+    slackApi("apps.connections.open", appToken),
+  ]);
+  const botResult = bot.ok
+    ? { ok: true, team: typeof bot.team === "string" ? bot.team : undefined, user: typeof bot.user === "string" ? bot.user : undefined }
+    : { ok: false, error: bot.error ?? "auth.test failed" };
+  const appResult = app.ok ? { ok: true } : { ok: false, error: app.error ?? "apps.connections.open failed" };
+  return { ok: botResult.ok && appResult.ok, bot: botResult, app: appResult };
+}
+
+interface ConfigPatchOutcome {
+  status: "ok" | "partial";
+  connectorsReload?: { started: string[]; stopped: string[]; errors: string[] };
+  connectorsReloadError?: string;
+}
+
+/** Merge a patch into config.yaml and reload connectors — the same steps
+ *  PUT /api/config performs, callable from a server-side flow that has to
+ *  read the outcome and possibly undo the write. */
+async function writeConfigPatchAndReload(context: ApiContext, patch: Record<string, unknown>): Promise<ConfigPatchOutcome> {
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = (yaml.load(fs.readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>) || {};
+  } catch { /* first write */ }
+  const merged = deepMerge(existing, patch);
+  context.suppressNextConnectorReload?.();
+  fs.writeFileSync(CONFIG_PATH, yaml.dump(merged));
+  invalidateModelRegistry();
+  _resetEngineProbeCache();
+  if (!context.reloadAllConnectors) return { status: "ok" };
+  try {
+    const reload = await context.reloadAllConnectors();
+    context.config = context.getConfig();
+    context.emit("connectors:reloaded", reload);
+    if (reload.errors.length > 0) context.clearSuppressNextConnectorReload?.();
+    return { status: reload.errors.length > 0 ? "partial" : "ok", connectorsReload: reload };
+  } catch (err) {
+    context.clearSuppressNextConnectorReload?.();
+    return { status: "ok", connectorsReloadError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+interface SlackConnectResult {
+  ok: boolean;
+  stage?: "verify" | "reload";
+  error?: string;
+  /** What was on disk before this attempt: an existing Slack block, or none.
+   *  Tells the caller what a rollback means here — "the old connection is
+   *  back" vs "the attempt was undone and Slack is unconfigured again". */
+  previous?: "config" | "none";
+  /** True only when the pre-attempt state is fully back: the file (the old
+   *  block restored, or removed again for previous:"none") AND the live
+   *  connectors settled on it without a Slack error — the old connector
+   *  running again for "config", nothing left to run for "none". Never true
+   *  when the second reload reported a failure. */
+  rolledBack?: boolean;
+  /** What the rollback achieved, separately: the file, and the live
+   *  connector. running is always false for previous:"none" — there is no
+   *  previous connector to bring back. */
+  restored?: { disk: boolean; running: boolean };
+  rollbackError?: string;
+  /** Set when the on-disk Slack block was changed by someone else between our
+   *  write and the rollback — we leave their value alone. */
+  rollbackSkipped?: string;
+  team?: string;
+  user?: string;
+  bot?: SlackVerifyResult["bot"];
+  app?: SlackVerifyResult["app"];
+}
+
+function slackFailure(outcome: ConfigPatchOutcome): string | null {
+  if (outcome.connectorsReloadError) return outcome.connectorsReloadError;
+  const errors = outcome.connectorsReload?.errors ?? [];
+  const slack = errors.find((line) => /slack/i.test(line));
+  if (slack) return slack;
+  if (outcome.status === "partial" && errors.length > 0) return errors.join(" | ");
+  return null;
+}
+
+function readSlackBlock(): Record<string, unknown> | null {
+  try {
+    const current = (yaml.load(fs.readFileSync(CONFIG_PATH, "utf-8")) as { connectors?: { slack?: Record<string, unknown> } }) || {};
+    return current.connectors?.slack ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function connectSlack(context: ApiContext, botToken: string, appToken: string): Promise<SlackConnectResult> {
+  const verified = await verifySlackTokens(botToken, appToken);
+  if (!verified.ok) return { ok: false, stage: "verify", error: "token verification failed", bot: verified.bot, app: verified.app };
+
+  // Snapshot → write → reload → (rollback) is ONE critical section: a PUT
+  // /api/config or a second connect waits for it, so the snapshot we would
+  // restore can never be older than what a concurrent writer put down.
+  return withConfigLock(async () => {
+    const previousSlack = readSlackBlock();
+    const previous = previousSlack ? ("config" as const) : ("none" as const);
+    const outcome = await writeConfigPatchAndReload(context, { connectors: { slack: { botToken, appToken } } });
+    const failure = slackFailure(outcome);
+    if (!failure) return { ok: true, team: verified.bot.team, user: verified.bot.user };
+
+    // The connector did not come up on tokens Slack itself accepted. Put the
+    // previous configuration back (or remove the block if there was none) —
+    // but only if the block on disk is still OURS: an out-of-band editor may
+    // have written something else meanwhile, and that is theirs to keep.
+    const onDisk = readSlackBlock();
+    if (onDisk?.botToken !== botToken || onDisk?.appToken !== appToken) {
+      logger.warn(`[onboarding] Slack connect failed (${failure}) but the Slack config changed concurrently — leaving it as is`);
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
+        restored: { disk: false, running: false }, rollbackSkipped: "config changed concurrently" };
+    }
+    logger.warn(`[onboarding] Slack connect failed after save (${failure}) — ${previous === "config" ? "restoring previous Slack config" : "removing the Slack block again"}`);
+    let rollback: ConfigPatchOutcome;
+    try {
+      rollback = await writeConfigPatchAndReload(context, { connectors: { slack: previousSlack ?? null } });
+    } catch (err) {
+      const rollbackError = err instanceof Error ? err.message : String(err);
+      logger.error(`[onboarding] Slack rollback write failed: ${rollbackError}`);
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
+        restored: { disk: false, running: false }, rollbackError };
+    }
+    // The rollback is only a rollback if the live side settled on the restored
+    // file: the previous connector came back up (previous:"config"), or the
+    // removal reload finished without a Slack error (previous:"none"). A
+    // partial/errored second reload is reported as such in both cases — the
+    // file is back, the connectors are not known to be.
+    const rollbackFailure = slackFailure(rollback);
+    if (rollbackFailure) {
+      logger.error(`[onboarding] Slack rollback wrote the previous config but the connectors did not settle on it: ${rollbackFailure}`);
+      return { ok: false, stage: "reload", error: failure, previous, rolledBack: false,
+        restored: { disk: true, running: false }, rollbackError: rollbackFailure };
+    }
+    return { ok: false, stage: "reload", error: failure, previous, rolledBack: true, restored: { disk: true, running: previous === "config" } };
+  });
 }

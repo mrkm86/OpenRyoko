@@ -76,6 +76,9 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
     devDependencies:
+      '@openryoko/web':
+        specifier: workspace:*
+        version: link:../web
       '@types/better-sqlite3':
         specifier: ^7.6.0
         version: 7.6.13
