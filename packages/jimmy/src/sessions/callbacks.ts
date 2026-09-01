@@ -156,6 +156,10 @@ async function _postToGateway(port: number, path: string, body: unknown, what: s
     body: JSON.stringify(body),
   });
 
+  // The body is irrelevant, but undici keeps the socket (and the buffered body) tied up until it
+  // is consumed or cancelled — release it before acting on the status.
+  await res.body?.cancel().catch(() => undefined);
+
   if (!res.ok) {
     throw new Error(`gateway responded ${res.status} when ${what}`);
   }
