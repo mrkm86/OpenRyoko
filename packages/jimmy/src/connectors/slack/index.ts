@@ -11,7 +11,12 @@ import type {
   SlackGoalExtractionConfig,
 } from "../../shared/types.js";
 import { buildReplyContext, deriveSessionKey, isOldSlackMessage } from "./threads.js";
-import { formatResponse, downloadAttachment } from "./format.js";
+import {
+  downloadAttachment,
+  formatAttachmentFailureNotice,
+  formatResponse,
+  resolveSlackFileAttachment,
+} from "./format.js";
 import { normalizeSpeakerInfo, type SpeakerInfo } from "./speaker.js";
 import { runTriage } from "./triage.js";
 import {
@@ -456,22 +461,31 @@ export class SlackConnector implements Connector {
 
       // Download attachments if present
       const attachments = [];
+      const failedAttachments: string[] = [];
       if ((event as any).files) {
         for (const file of (event as any).files) {
           try {
+            const resolved = await resolveSlackFileAttachment(
+              file,
+              (args) => this.app.client.files.info(args),
+            );
             const localPath = await downloadAttachment(
-              file.url_private,
+              resolved.url,
               this.app.client.token!,
               TMP_DIR,
             );
             attachments.push({
-              name: file.name,
-              url: file.url_private,
-              mimeType: file.mimetype,
+              name: resolved.name,
+              url: resolved.url,
+              mimeType: resolved.mimeType,
               localPath,
             });
           } catch (err) {
-            logger.warn(`Failed to download attachment: ${err}`);
+            // File names are user-controlled. Keep the injected failure notice
+            // limited to Slack's opaque ID so it cannot become prompt content.
+            const label = file.id ? `Slack file ${file.id}` : "Slack attachment";
+            failedAttachments.push(label);
+            logger.warn(`[slack] Failed to retrieve attachment ${label}: ${err}`);
           }
         }
       }
@@ -490,7 +504,10 @@ export class SlackConnector implements Connector {
       // "[Thread context — …]" preamble below silently breaks that parsing,
       // so a command typed inside a Slack thread would never be intercepted.
       // Commands don't need conversation context anyway — pass them verbatim.
-      const text = startsWithSlashCommand(rawText) ? rawText : parentContext + rawText;
+      const attachmentFailureNotice = formatAttachmentFailureNotice(failedAttachments);
+      const text = startsWithSlashCommand(rawText)
+        ? rawText + attachmentFailureNotice
+        : parentContext + rawText + attachmentFailureNotice;
 
       const msg: IncomingMessage = {
         connector: this.name,
