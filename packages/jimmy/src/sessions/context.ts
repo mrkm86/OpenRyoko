@@ -1054,30 +1054,30 @@ ryoko api POST /api/sessions/<child-id>/message \\
   --data '{"message": "<follow-up>"}'
 \`\`\`
 
-6. **Collect the result yourself**: read the child's output when it is done:
-\`\`\`bash
-ryoko api GET /api/sessions/<child-id>
-\`\`\`
-**Do NOT end your turn expecting to be woken up.** The gateway attempts an onComplete
-notification, but delivery is NOT guaranteed — it is silently skipped when the child has no
-\`parentSessionId\`, when the employee sets \`alwaysNotify: false\`, or when the parent is already
-in \`error\`. A parent that ends its turn waiting for a notification that never arrives stops
-silently, and nobody is told.
+6. **Respond immediately**: tell the user you have delegated and will follow up when the child reports back, then end your turn. **Do NOT poll or sleep-loop inside your turn** waiting for the child — a turn has a hard time limit, and a blocked turn cannot answer anyone.
 
-7. **If the work outlives your turn**, do not hand-roll detach + polling. Use the self-waking job
-runner, which DOES guarantee a wake-up on exit (success or failure):
-\`\`\`bash
-ryoko job run --name <job> --session <your-session-id> -- '<command>'
-\`\`\`
+7. **onComplete notification** (the primary wake-up — attempted, not guaranteed): when the child finishes, the gateway posts a notification into your session and you are woken with a preview and the child's session id. The notification is skipped silently when any of these hold:
+   - the child was spawned without your \`parentSessionId\` (an unlinked child never notifies anyone)
+   - the employee sets \`alwaysNotify: false\`
+   - your session is already in \`error\`
+   If the POST itself fails (gateway restart, auth), a warning goes to the gateway log — not to you.
 
-8. **Review**: assess the collected work using oversight levels (TRUST / VERIFY / THOROUGH) based on
-complexity and risk, then relay the result to the user.
+8. **Safety net**: if the user asks about progress, or a reply is overdue, read the child yourself:
+\`\`\`bash
+ryoko api GET /api/sessions/<child-id>?last=5
+\`\`\`
+For a delegation that must not stall unnoticed, arm a watchdog. The job runner guarantees a wake-up on exit (success or failure), so you are woken on the deadline at the latest:
+\`\`\`bash
+ryoko job run --name watchdog-<employee> --session <your-session-id> -- 'sleep 1800'
+\`\`\`
+When the watchdog wakes you, check the child: if you already relayed its result, nothing more is needed — otherwise relay it, or tell the user what is still pending.
+
+9. **Review**: when the notification (or the watchdog) wakes you, read the child's messages and assess the work using oversight levels (TRUST / VERIFY / THOROUGH) based on complexity and risk, then relay the result to the user.
 
 ### Key rules
-- **Never end your turn waiting for a child session's completion notification.** It may never
-  arrive (see step 6). Collect the result yourself, or use \`ryoko job run\`, which guarantees a wake-up.
-- **Always pass \`parentSessionId\`** when spawning. Without it the child is unlinked and no
-  notification is even attempted.
+- **Always pass \`parentSessionId\`** when spawning. Without it the child is unlinked and no notification is even attempted.
+- **Never poll or sleep-loop inside your turn** waiting for a child. Reply, end your turn, and let the notification wake you.
+- **The notification is not a guarantee** (step 7). If you have not heard back when the user asks, read the child yourself; for a hard deadline, arm the watchdog.
 - **Always reuse** child sessions — never create duplicates for the same employee.
 - **Parallel spawning**: For independent sub-tasks, spawn multiple employees simultaneously.
 - **Cross-reference**: Compare results from multiple employees before responding.
